@@ -1,91 +1,95 @@
 import os
 import requests
 from datetime import datetime, timedelta
-from collections import Counter
+from zoneinfo import ZoneInfo
 
+# --- CONFIG ---
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+CAMEROON = ZoneInfo("Africa/Douala")
 HEADERS = {"x-apisports-key": API_KEY}
+BASE_URL = "https://v3.football.api-sports.io/fixtures"
 
-def get_finished_matches(date_str):
-    url = f"https://v3.football.api-sports.io/fixtures?date={date_str}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    data = r.json().get("response", [])
-    finished = [m for m in data if m["fixture"]["status"]["short"] == "FT"]
-    return finished
+def fetch(date_str):
+    """Récupère tous les matchs d'une date en heure de Bafoussam"""
+    url = f"{BASE_URL}?date={date_str}&timezone=Africa/Douala"
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    return r.json().get("response", [])
 
-def analyze(matches):
-    if not matches:
-        return None
-    total = len(matches)
-    home_win = sum(1 for m in matches if m["goals"]["home"] > m["goals"]["away"])
-    away_win = sum(1 for m in matches if m["goals"]["away"] > m["goals"]["home"])
-    draw = total - home_win - away_win
-    over15 = sum(1 for m in matches if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 1.5)
-    over25 = sum(1 for m in matches if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 2.5)
-    btts = sum(1 for m in matches if m["goals"]["home"]>0 and m["goals"]["away"]>0)
+def analyze(fixtures):
+    ft = [m for m in fixtures if m["fixture"]["status"]["short"] == "FT"]
+    if not ft: return None
+    total = len(ft)
+    def pct(n): return round(n/total*100, 1)
+    hw = sum(1 for m in ft if m["goals"]["home"] > m["goals"]["away"])
+    aw = sum(1 for m in ft if m["goals"]["away"] > m["goals"]["home"])
+    dr = total - hw - aw
+    o15 = sum(1 for m in ft if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 1.5)
+    o25 = sum(1 for m in ft if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 2.5)
+    btts = sum(1 for m in ft if m["goals"]["home"]>0 and m["goals"]["away"]>0)
+    return {"total": total, "home": pct(hw), "away": pct(aw), "draw": pct(dr), "over15": pct(o15), "over25": pct(o25), "btts": pct(btts)}
 
-    return {
-        "total": total,
-        "home": home_win/total*100,
-        "away": away_win/total*100,
-        "draw": draw/total*100,
-        "over15": over15/total*100,
-        "over25": over25/total*100,
-        "btts": btts/total*100,
-    }
+# --- TEMPS RÉEL BAFOSSAM ---
+now = datetime.now(CAMEROON)
+today_str = now.date().isoformat()
+yesterday_str = (now.date() - timedelta(days=1)).isoformat()
 
-def format_table(a, b, label_a, label_b):
-    lines = [
-        f"📊 *AGENT SCIENTIFIQUE SPORTS* 📊",
-        f"Analyse {label_a} vs {label_b} | {datetime.now().strftime('%d/%m %H:%M')}",
-        "",
-        f"`{'Loi':<10} {label_a:<8} {label_b:<8} Tendance`",
-        f"`{'-'*40}`",
-    ]
-    laws = [("Domicile","home"),("Extérieur","away"),("Nul","draw"),("Over1.5","over15"),("Over2.5","over25"),("BTTS","btts")]
-    best_law = ""
-    best_gain = -100
-    for name, key in laws:
-        va = a[key] if a else 0
-        vb = b[key] if b else 0
-        diff = vb - va
-        emoji = "🔥" if diff>10 else "📈" if diff>0 else "📉"
-        if diff > best_gain:
-            best_gain = diff
-            best_law = name
-        lines.append(f"`{name:<10} {va:5.1f}% {vb:5.1f}% {emoji} {diff:+.1f}%`")
+print(f"Analyse lancée à Bafoussam: {now.strftime('%H:%M %d/%m/%Y')}")
 
-    lines += ["", f"🏆 *Loi la plus en hausse: {best_law} ({best_gain:+.1f}%) aujourd'hui*"]
+fixtures_yesterday = fetch(yesterday_str)
+fixtures_today = fetch(today_str)
 
-    if b and b['total']>0:
-        if b['home']>65: lines.append(f"⚠️ TENDANCE: {b['home']:.0f}% victoires DOMICILE aujourd'hui!")
-        if b['over25']>70: lines.append(f"⚠️ TENDANCE: Journée à BUTS {b['over25']:.0f}% Over2.5!")
-        if b['btts']>65: lines.append(f"⚠️ TENDANCE: BTTS énorme {b['btts']:.0f}%!")
+stats_y = analyze(fixtures_yesterday)
+stats_today_ft = analyze(fixtures_today)
 
-    lines.append(f"\n_Matchs analysés: {a['total'] if a else 0} hier / {b['total'] if b else 0} auj._")
-    return "\n".join(lines)
+# Chronologie du temps réel aujourd'hui
+live = [m for m in fixtures_today if m["fixture"]["status"]["short"] in ["1H","2H","HT","ET","P","LIVE"]]
+upcoming = [m for m in fixtures_today if m["fixture"]["status"]["short"] == "NS"]
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    requests.post(url, json=payload, timeout=15)
+# Filtrer les matchs à venir APRÈS ton heure actuelle
+upcoming_future = []
+for m in upcoming:
+    # l'heure du match est déjà en Africa/Douala grâce à l'API
+    kickoff_ts = m["fixture"]["timestamp"]
+    kickoff = datetime.fromtimestamp(kickoff_ts, tz=CAMEROON)
+    if kickoff > now:
+        upcoming_future.append(m)
 
-if __name__ == "__main__":
-    today = datetime.now().date()
-    yesterday = today - timedelta(days=1)
+# Meilleure loi d'hier
+if stats_y:
+    best_loi = max([("Domicile", stats_y["home"]), ("Over 1.5", stats_y["over15"]), ("Over 2.5", stats_y["over25"]), ("BTTS", stats_y["btts"])], key=lambda x: x[1])
+else:
+    best_loi = ("Over 1.5", 0)
 
-    print(f"Analyse {yesterday} et {today}")
-    matches_y = get_finished_matches(str(yesterday))
-    matches_t = get_finished_matches(str(today))
+# --- MESSAGE TELEGRAM ---
+message = f"📍 *AGENT SCIENTIFIQUE V3 - BAFOSSAM*\n"
+message += f"🕐 {now.strftime('%H:%M')} - {now.strftime('%d %B %Y')}\n\n"
 
-    if not matches_y and not matches_t:
-        send_telegram(f"🤖 Agent en ligne - Pas encore de matchs finis aujourd'hui ({today}). {len(matches_y)} hier.")
-    else:
-        stats_y = analyze(matches_y)
-        stats_t = analyze(matches_t)
-        msg = format_table(stats_y, stats_t, "HIER", "AUJ")
-        print(msg)
-        send_telegram(msg)
+if stats_y:
+    message += f"*HIER ({yesterday_str})* - {stats_y['total']} matchs finis\n"
+    message += f"`Domicile: {stats_y['home']}% | Ext: {stats_y['away']}% | Nul: {stats_y['draw']}%`\n"
+    message += f"`Over1.5: {stats_y['over15']}% | Over2.5: {stats_y['over25']}% | BTTS: {stats_y['btts']}%`\n\n"
+else:
+    message += f"Aucun match fini hier.\n\n"
+
+message += f"*AUJOURD'HUI ({today_str})*\n"
+if stats_today_ft:
+    message += f"✅ Finis: {stats_today_ft['total']} matchs\n"
+message += f"🔴 Live maintenant: {len(live)} matchs\n"
+message += f"⏳ À venir après {now.strftime('%H:%M')}: {len(upcoming_future)} matchs\n\n"
+
+message += f"🏆 *LOI DU JOUR (basée sur hier): {best_loi[0]} à {best_loi[1]}%*\n"
+message += f"👉 À appliquer sur les {len(upcoming_future)} prochains matchs.\n"
+
+if len(upcoming_future) > 0:
+    message += f"\n*PROCHAINS MATCHS:*\n"
+    for m in upcoming_future[:5]: # 5 premiers
+        heure = datetime.fromtimestamp(m["fixture"]["timestamp"], tz=CAMEROON).strftime('%H:%M')
+        message += f"{heure} - {m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
+
+# Envoi
+url_tg = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+requests.post(url_tg, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+print("Message envoyé")
