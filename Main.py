@@ -1,12 +1,12 @@
 # ============================================================
-# AGENT PRO FOOTBALL V3
+# AGENT PRO FOOTBALL V4
 # "LA BOUGIE DU PARIEUR"
 #
-# Architecture :
+# Architecture V4
 #
 # DATA
 #   ↓
-# FORM / HOME-AWAY / H2H / STRENGTH
+# FORM / HOME-AWAY / H2H
 #   ↓
 # POISSON + API PREDICTION
 #   ↓
@@ -18,6 +18,8 @@
 #   ↓
 # CONVERGENCE
 #   ↓
+# CALIBRATION V4
+#   ↓
 # DECISION ENGINE
 #   ↓
 # PRE-MATCH
@@ -26,11 +28,11 @@
 #   ↓
 # RESULT
 #   ↓
-# DATABASE / BACKTEST
+# PERFORMANCE
 #   ↓
-# CALIBRATION
+# AUTO-CALIBRATION
 #
-# Variables GitHub / Render / Railway :
+# Variables d'environnement :
 #
 # API_FOOTBALL_KEY
 # TELEGRAM_TOKEN
@@ -42,7 +44,9 @@
 # LIVE_INTERVAL=60
 # MAX_CANDIDATES=15
 # MIN_SCORE=70
-# DB_FILE=agent_pro.db
+# MIN_VALUE=3
+# DB_FILE=agent_pro_v4.db
+#
 # ============================================================
 
 import os
@@ -51,6 +55,7 @@ import math
 import sqlite3
 import logging
 import threading
+import statistics
 import requests
 
 from datetime import datetime, timedelta
@@ -59,7 +64,7 @@ from collections import defaultdict
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 API_KEY = os.getenv("API_FOOTBALL_KEY")
@@ -68,78 +73,165 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
 TZ = ZoneInfo("Africa/Douala")
 
-ANALYSIS_INTERVAL = int(os.getenv("ANALYSIS_INTERVAL", "1800"))
-LIVE_INTERVAL = int(os.getenv("LIVE_INTERVAL", "60"))
-MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "15"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
-
-DB_FILE = os.getenv("DB_FILE", "agent_pro.db")
-
 API_BASE = "https://v3.football.api-sports.io"
+
+ANALYSIS_INTERVAL = int(
+    os.getenv("ANALYSIS_INTERVAL", "1800")
+)
+
+LIVE_INTERVAL = int(
+    os.getenv("LIVE_INTERVAL", "60")
+)
+
+MAX_CANDIDATES = int(
+    os.getenv("MAX_CANDIDATES", "15")
+)
+
+MIN_SCORE = float(
+    os.getenv("MIN_SCORE", "70")
+)
+
+MIN_VALUE = float(
+    os.getenv("MIN_VALUE", "3")
+)
+
+DB_FILE = os.getenv(
+    "DB_FILE",
+    "agent_pro_v4.db"
+)
 
 HEADERS = {
     "x-apisports-key": API_KEY or "",
     "Accept": "application/json"
 }
 
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
 )
 
 
 # ============================================================
-# GLOBAL STATE
+# GLOBALS
 # ============================================================
-
-CACHE = {}
-LIVE_STATE = {}
-ANALYSIS_MEMORY = {}
 
 API_LOCK = threading.Lock()
 
+CACHE = {}
+
+LIVE_STATE = {}
+
+LAST_TELEGRAM = {}
+
+MODEL_VERSION = "V4.0"
+
 
 # ============================================================
-# UTILITIES
+# BASIC UTILITIES
 # ============================================================
 
 def now():
     return datetime.now(TZ)
 
 
-def clamp(x, minimum=0, maximum=100):
+def clamp(
+    value,
+    minimum=0,
+    maximum=100
+):
+
     try:
-        return max(minimum, min(maximum, float(x)))
+
+        return max(
+            minimum,
+            min(
+                maximum,
+                float(value)
+            )
+        )
+
     except Exception:
+
         return minimum
 
 
-def safe_float(x, default=0.0):
+def safe_float(
+    value,
+    default=0.0
+):
+
     try:
-        if x is None:
+
+        if value is None:
             return default
 
-        if isinstance(x, str):
-            x = x.replace("%", "").strip()
+        if isinstance(
+            value,
+            str
+        ):
 
-        return float(x)
+            value = (
+                value
+                .replace(
+                    "%",
+                    ""
+                )
+                .strip()
+            )
+
+        return float(value)
 
     except Exception:
+
         return default
 
 
-def safe_int(x, default=0):
+def safe_int(
+    value,
+    default=0
+):
+
     try:
-        return int(x)
+
+        return int(value)
+
     except Exception:
+
         return default
 
 
-def pct(x):
-    return f"{x:.1f}%"
+def mean(
+    values,
+    default=0
+):
 
+    values = [
+        safe_float(v)
+        for v in values
+        if v is not None
+    ]
+
+    if not values:
+        return default
+
+    return sum(values) / len(values)
+
+
+# ============================================================
+# CACHE
+# ============================================================
 
 def cache_get(key):
+
     item = CACHE.get(key)
 
     if not item:
@@ -148,12 +240,18 @@ def cache_get(key):
     timestamp, data, ttl = item
 
     if time.time() - timestamp < ttl:
+
         return data
 
     return None
 
 
-def cache_set(key, data, ttl):
+def cache_set(
+    key,
+    data,
+    ttl
+):
+
     CACHE[key] = (
         time.time(),
         data,
@@ -162,16 +260,31 @@ def cache_set(key, data, ttl):
 
 
 # ============================================================
-# API FOOTBALL ENGINE
+# API ENGINE
 # ============================================================
 
-def api(endpoint, params=None, ttl=30):
+def api(
+    endpoint,
+    params=None,
+    ttl=30
+):
 
-    key = endpoint + "|" + str(params or {})
+    params = params or {}
+
+    key = (
+        endpoint
+        + "|"
+        + str(
+            sorted(
+                params.items()
+            )
+        )
+    )
 
     cached = cache_get(key)
 
     if cached is not None:
+
         return cached
 
     with API_LOCK:
@@ -181,42 +294,41 @@ def api(endpoint, params=None, ttl=30):
             response = requests.get(
                 API_BASE + endpoint,
                 headers=HEADERS,
-                params=params or {},
+                params=params,
                 timeout=25
             )
 
             if response.status_code != 200:
 
                 logging.warning(
-                    "API %s -> HTTP %s",
-                    endpoint,
-                    response.status_code
+                    "API HTTP %s : %s",
+                    response.status_code,
+                    endpoint
                 )
 
                 return []
 
             payload = response.json()
 
-            errors = payload.get("errors")
+            if payload.get("errors"):
 
-            if errors:
                 logging.warning(
                     "API errors: %s",
-                    errors
+                    payload.get("errors")
                 )
 
-            data = payload.get(
+            result = payload.get(
                 "response",
                 []
             )
 
             cache_set(
                 key,
-                data,
+                result,
                 ttl
             )
 
-            return data
+            return result
 
         except Exception as e:
 
@@ -233,7 +345,7 @@ def api(endpoint, params=None, ttl=30):
 # DATABASE
 # ============================================================
 
-def db():
+def database():
 
     connection = sqlite3.connect(
         DB_FILE,
@@ -247,7 +359,7 @@ def db():
 
 def init_database():
 
-    connection = db()
+    connection = database()
 
     cursor = connection.cursor()
 
@@ -268,7 +380,13 @@ def init_database():
 
             market TEXT,
 
+            market_name TEXT,
+
             probability REAL,
+
+            raw_probability REAL,
+
+            calibrated_probability REAL,
 
             fair_odds REAL,
 
@@ -282,7 +400,7 @@ def init_database():
 
             convergence REAL,
 
-            data_quality REAL,
+            quality REAL,
 
             lambda_home REAL,
 
@@ -290,9 +408,17 @@ def init_database():
 
             prediction TEXT,
 
+            decision TEXT,
+
+            model_version TEXT,
+
             status TEXT DEFAULT 'PENDING',
 
             actual_result TEXT,
+
+            actual_home_goals INTEGER,
+
+            actual_away_goals INTEGER,
 
             profit REAL DEFAULT 0
 
@@ -333,71 +459,51 @@ def init_database():
         )
     """)
 
-    connection.commit()
-
-    connection.close()
-
-
-def save_prediction(a):
-
-    connection = db()
-
-    cursor = connection.cursor()
-
     cursor.execute("""
-        INSERT OR REPLACE INTO predictions (
+        CREATE TABLE IF NOT EXISTS model_calibration (
 
-            fixture_id,
-            created_at,
-            kickoff,
-            home,
-            away,
-            market,
-            probability,
-            fair_odds,
-            bookmaker_odds,
-            value,
-            score,
-            risk,
-            convergence,
-            data_quality,
-            lambda_home,
-            lambda_away,
-            prediction,
-            status
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            created_at TEXT,
+
+            bucket TEXT,
+
+            predictions INTEGER,
+
+            wins INTEGER,
+
+            observed_rate REAL,
+
+            expected_rate REAL,
+
+            calibration_error REAL
 
         )
+    """)
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS model_events (
 
-    """, (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-        a["fixture_id"],
-        now().isoformat(),
-        a["kickoff"],
-        a["home"],
-        a["away"],
-        a["market"],
-        a["probability"],
-        a["fair_odds"],
-        a["odd"],
-        a["value"],
-        a["score"],
-        a["risk"],
-        a["convergence"],
-        a["quality"],
-        a["lambda_home"],
-        a["lambda_away"],
-        a["market"]
+            created_at TEXT,
 
-    ))
+            event_type TEXT,
+
+            description TEXT,
+
+            value REAL
+
+        )
+    """)
 
     connection.commit()
+
     connection.close()
 
 
 # ============================================================
-# FIXTURES
+# FIXTURE ENGINE
 # ============================================================
 
 def get_today_fixtures():
@@ -414,31 +520,39 @@ def get_today_fixtures():
     )
 
 
-def get_upcoming():
+def get_upcoming_fixtures():
 
     fixtures = get_today_fixtures()
 
-    result = []
+    upcoming = []
 
     for fixture in fixtures:
 
-        status = fixture["fixture"]["status"]["short"]
+        status = (
+            fixture
+            .get("fixture", {})
+            .get("status", {})
+            .get("short")
+        )
 
         if status in [
             "NS",
             "TBD"
         ]:
 
-            result.append(fixture)
+            upcoming.append(
+                fixture
+            )
 
-    result.sort(
-        key=lambda x: x["fixture"]["timestamp"]
+    upcoming.sort(
+        key=lambda x:
+        x["fixture"]["timestamp"]
     )
 
-    return result
+    return upcoming
 
 
-def get_live():
+def get_live_fixtures():
 
     return api(
         "/fixtures",
@@ -450,10 +564,41 @@ def get_live():
 
 
 # ============================================================
-# TEAM FORM ENGINE
+# FORM ENGINE
 # ============================================================
 
-def get_form(team_id, last=10):
+def empty_form():
+
+    return {
+
+        "matches": 0,
+
+        "W": 0,
+        "D": 0,
+        "L": 0,
+
+        "GF": 0,
+        "GA": 0,
+
+        "avg_gf": 0,
+        "avg_ga": 0,
+
+        "over15": 0,
+        "over25": 0,
+        "over35": 0,
+
+        "btts": 0,
+        "clean": 0,
+
+        "form": ""
+
+    }
+
+
+def get_form(
+    team_id,
+    last=10
+):
 
     fixtures = api(
         "/fixtures",
@@ -469,16 +614,29 @@ def get_form(team_id, last=10):
 
     for match in fixtures:
 
-        if match["fixture"]["status"]["short"] == "FT":
+        status = (
+            match
+            .get("fixture", {})
+            .get("status", {})
+            .get("short")
+        )
 
-            finished.append(match)
+        if status == "FT":
+
+            finished.append(
+                match
+            )
 
     if not finished:
 
         return empty_form()
 
-    W = D = L = 0
-    GF = GA = 0
+    W = 0
+    D = 0
+    L = 0
+
+    GF = 0
+    GA = 0
 
     over15 = 0
     over25 = 0
@@ -486,16 +644,21 @@ def get_form(team_id, last=10):
     btts = 0
     clean = 0
 
-    sequence = []
+    form = []
 
-    weights = []
+    for match in finished:
 
-    for index, match in enumerate(finished):
+        home_id = (
+            match["teams"]["home"]["id"]
+        )
 
-        home_id = match["teams"]["home"]["id"]
+        hg = safe_int(
+            match["goals"]["home"]
+        )
 
-        hg = safe_int(match["goals"]["home"])
-        ag = safe_int(match["goals"]["away"])
+        ag = safe_int(
+            match["goals"]["away"]
+        )
 
         if home_id == team_id:
 
@@ -507,32 +670,23 @@ def get_form(team_id, last=10):
             gf = ag
             ga = hg
 
-        # Plus le match est récent,
-        # plus son poids est important.
-        weight = max(
-            1,
-            len(finished) - index
-        )
-
-        weights.append(weight)
-
         GF += gf
         GA += ga
 
         if gf > ga:
 
             W += 1
-            sequence.append("V")
+            form.append("V")
 
         elif gf == ga:
 
             D += 1
-            sequence.append("N")
+            form.append("N")
 
         else:
 
             L += 1
-            sequence.append("D")
+            form.append("D")
 
         total = gf + ga
 
@@ -574,39 +728,7 @@ def get_form(team_id, last=10):
         "btts": btts / n * 100,
         "clean": clean / n * 100,
 
-        "form": "".join(sequence),
-
-        "recent_weight": sum(weights)
-
-    }
-
-
-def empty_form():
-
-    return {
-
-        "matches": 0,
-
-        "W": 0,
-        "D": 0,
-        "L": 0,
-
-        "GF": 0,
-        "GA": 0,
-
-        "avg_gf": 0,
-        "avg_ga": 0,
-
-        "over15": 0,
-        "over25": 0,
-        "over35": 0,
-
-        "btts": 0,
-        "clean": 0,
-
-        "form": "",
-
-        "recent_weight": 0
+        "form": "".join(form)
 
     }
 
@@ -615,13 +737,17 @@ def empty_form():
 # HOME / AWAY ENGINE
 # ============================================================
 
-def get_venue_form(team_id, venue):
+def get_venue_form(
+    team_id,
+    venue,
+    last=15
+):
 
     fixtures = api(
         "/fixtures",
         {
             "team": team_id,
-            "last": 15,
+            "last": last,
             "timezone": "Africa/Douala"
         },
         ttl=900
@@ -631,40 +757,77 @@ def get_venue_form(team_id, venue):
 
     for match in fixtures:
 
-        if match["fixture"]["status"]["short"] != "FT":
+        if (
+            match
+            .get("fixture", {})
+            .get("status", {})
+            .get("short")
+            != "FT"
+        ):
+
             continue
 
-        home_id = match["teams"]["home"]["id"]
+        home_id = (
+            match["teams"]["home"]["id"]
+        )
 
-        if venue == "home" and home_id == team_id:
-            selected.append(match)
+        if (
+            venue == "home"
+            and
+            home_id == team_id
+        ):
 
-        elif venue == "away" and home_id != team_id:
-            selected.append(match)
+            selected.append(
+                match
+            )
+
+        elif (
+            venue == "away"
+            and
+            home_id != team_id
+        ):
+
+            selected.append(
+                match
+            )
 
     selected = selected[:8]
 
     if not selected:
 
         return {
+
             "matches": 0,
+
             "W": 0,
             "D": 0,
             "L": 0,
+
             "GF": 0,
             "GA": 0,
+
             "avg_gf": 0,
             "avg_ga": 0
+
         }
 
-    W = D = L = GF = GA = 0
+    W = D = L = 0
+
+    GF = GA = 0
 
     for match in selected:
 
-        home_id = match["teams"]["home"]["id"]
+        home_id = (
+            match["teams"]["home"]["id"]
+        )
 
-        hg = safe_int(match["goals"]["home"])
-        ag = safe_int(match["goals"]["away"])
+        hg = safe_int(
+            match["goals"]["home"]
+        )
+
+        ag = safe_int(
+            match["goals"]["away"]
+        )
 
         if home_id == team_id:
 
@@ -680,12 +843,15 @@ def get_venue_form(team_id, venue):
         GA += ga
 
         if gf > ga:
+
             W += 1
 
         elif gf == ga:
+
             D += 1
 
         else:
+
             L += 1
 
     n = len(selected)
@@ -711,14 +877,19 @@ def get_venue_form(team_id, venue):
 # H2H ENGINE
 # ============================================================
 
-def get_h2h(team1, team2):
+def get_h2h(
+    team1,
+    team2
+):
 
     fixtures = api(
         "/fixtures/headtohead",
         {
-            "h2h": f"{team1}-{team2}",
+            "h2h":
+                f"{team1}-{team2}",
             "last": 10,
-            "timezone": "Africa/Douala"
+            "timezone":
+                "Africa/Douala"
         },
         ttl=3600
     )
@@ -741,15 +912,29 @@ def get_h2h(team1, team2):
 
     for match in fixtures:
 
-        if match["fixture"]["status"]["short"] != "FT":
+        if (
+            match
+            .get("fixture", {})
+            .get("status", {})
+            .get("short")
+            != "FT"
+        ):
+
             continue
 
         result["matches"] += 1
 
-        home_id = match["teams"]["home"]["id"]
+        home_id = (
+            match["teams"]["home"]["id"]
+        )
 
-        hg = safe_int(match["goals"]["home"])
-        ag = safe_int(match["goals"]["away"])
+        hg = safe_int(
+            match["goals"]["home"]
+        )
+
+        ag = safe_int(
+            match["goals"]["away"]
+        )
 
         if home_id == team1:
 
@@ -765,28 +950,35 @@ def get_h2h(team1, team2):
         result["ga"] += ga
 
         if gf > ga:
+
             result["w1"] += 1
 
         elif gf < ga:
+
             result["w2"] += 1
 
         else:
+
             result["draw"] += 1
 
         if gf + ga >= 3:
+
             result["over25"] += 1
 
         if gf > 0 and ga > 0:
+
             result["btts"] += 1
 
     return result
 
 
 # ============================================================
-# API-FOOTBALL PREDICTION ENGINE
+# API PREDICTION
 # ============================================================
 
-def get_api_prediction(fixture_id):
+def get_api_prediction(
+    fixture_id
+):
 
     data = api(
         "/predictions",
@@ -797,15 +989,17 @@ def get_api_prediction(fixture_id):
     )
 
     if not data:
+
         return {}
 
     try:
 
-        item = data[0]
-
-        prediction = item.get(
-            "predictions",
-            {}
+        prediction = (
+            data[0]
+            .get(
+                "predictions",
+                {}
+            )
         )
 
         percent = prediction.get(
@@ -813,34 +1007,41 @@ def get_api_prediction(fixture_id):
             {}
         )
 
+        winner = (
+            prediction
+            .get("winner")
+            or {}
+        )
+
         return {
 
-            "home": safe_float(
-                percent.get("home")
-            ),
+            "home":
+                safe_float(
+                    percent.get("home")
+                ),
 
-            "draw": safe_float(
-                percent.get("draw")
-            ),
+            "draw":
+                safe_float(
+                    percent.get("draw")
+                ),
 
-            "away": safe_float(
-                percent.get("away")
-            ),
+            "away":
+                safe_float(
+                    percent.get("away")
+                ),
 
-            "winner": (
-                prediction
-                .get("winner")
-                or {}
-            )
-            .get("name"),
+            "winner":
+                winner.get("name"),
 
-            "advice": prediction.get(
-                "advice"
-            ),
+            "advice":
+                prediction.get(
+                    "advice"
+                ),
 
-            "under_over": prediction.get(
-                "under_over"
-            )
+            "under_over":
+                prediction.get(
+                    "under_over"
+                )
 
         }
 
@@ -853,9 +1054,11 @@ def get_api_prediction(fixture_id):
 # ODDS ENGINE
 # ============================================================
 
-def parse_odds_response(data):
+def parse_odds(
+    data
+):
 
-    result = {}
+    odds = {}
 
     for bookmaker in data:
 
@@ -869,17 +1072,17 @@ def parse_odds_response(data):
                 "Unknown"
             )
 
-            for market in book.get(
+            for bet in book.get(
                 "bets",
                 []
             ):
 
-                market_name = market.get(
+                market = bet.get(
                     "name",
                     ""
                 )
 
-                for value in market.get(
+                for value in bet.get(
                     "values",
                     []
                 ):
@@ -889,130 +1092,179 @@ def parse_odds_response(data):
                     )
 
                     odd = safe_float(
-                        value.get("odd")
+                        value.get(
+                            "odd"
+                        )
                     )
 
-                    if not label or odd <= 1:
+                    if (
+                        not label
+                        or
+                        odd <= 1
+                    ):
+
                         continue
 
-                    key = (
+                    odds[(
                         bookmaker_name,
-                        market_name,
+                        market,
                         str(label)
-                    )
+                    )] = odd
 
-                    result[key] = odd
-
-    return result
+    return odds
 
 
-def get_prematch_odds(fixture_id):
+def get_odds(
+    fixture_id,
+    live=False
+):
 
-    data = api(
-        "/odds",
-        {
-            "fixture": fixture_id
-        },
-        ttl=180
+    endpoint = (
+        "/odds/live"
+        if live
+        else
+        "/odds"
     )
 
-    return parse_odds_response(data)
-
-
-def get_live_odds(fixture_id):
-
-    data = api(
-        "/odds/live",
-        {
-            "fixture": fixture_id
-        },
-        ttl=15
+    return parse_odds(
+        api(
+            endpoint,
+            {
+                "fixture":
+                    fixture_id
+            },
+            ttl=15 if live else 180
+        )
     )
 
-    return parse_odds_response(data)
 
+def find_odd(
+    odds,
+    market
+):
 
-def find_odd(odds, market):
+    mapping = {
 
-    possible = []
-
-    if market == "HOME":
-        possible = [
-            ("Match Winner", "Home"),
-            ("Home/Away", "Home")
-        ]
-
-    elif market == "DRAW":
-        possible = [
-            ("Match Winner", "Draw"),
-            ("Home/Away", "Draw")
-        ]
-
-    elif market == "AWAY":
-        possible = [
-            ("Match Winner", "Away"),
-            ("Home/Away", "Away")
-        ]
-
-    elif market == "OVER15":
-        possible = [
-            ("Goals Over/Under", "Over 1.5")
-        ]
-
-    elif market == "OVER25":
-        possible = [
-            ("Goals Over/Under", "Over 2.5")
-        ]
-
-    elif market == "OVER35":
-        possible = [
-            ("Goals Over/Under", "Over 3.5")
-        ]
-
-    elif market == "BTTS":
-        possible = [
-            ("Both Teams Score", "Yes")
-        ]
-
-    for bookmaker in sorted(
-        set(k[0] for k in odds.keys())
-    ):
-
-        for market_name, label in possible:
-
-            key = (
-                bookmaker,
-                market_name,
-                label
+        "HOME": [
+            (
+                "Match Winner",
+                "Home"
             )
+        ],
 
-            if key in odds:
+        "DRAW": [
+            (
+                "Match Winner",
+                "Draw"
+            )
+        ],
 
-                possible_odd = odds[key]
+        "AWAY": [
+            (
+                "Match Winner",
+                "Away"
+            )
+        ],
 
-                if possible_odd > 1:
+        "OVER15": [
+            (
+                "Goals Over/Under",
+                "Over 1.5"
+            )
+        ],
 
-                    return possible_odd
+        "OVER25": [
+            (
+                "Goals Over/Under",
+                "Over 2.5"
+            )
+        ],
 
-    return None
+        "OVER35": [
+            (
+                "Goals Over/Under",
+                "Over 3.5"
+            )
+        ],
+
+        "BTTS": [
+            (
+                "Both Teams Score",
+                "Yes"
+            )
+        ]
+
+    }
+
+    targets = mapping.get(
+        market,
+        []
+    )
+
+    candidates = []
+
+    for (
+        bookmaker,
+        market_name_,
+        label
+    ), odd in odds.items():
+
+        for (
+            target_market,
+            target_label
+        ) in targets:
+
+            if (
+                market_name_
+                == target_market
+                and
+                label
+                == target_label
+            ):
+
+                candidates.append(
+                    odd
+                )
+
+    if not candidates:
+
+        return None
+
+    # On utilise la meilleure cote disponible.
+    return max(
+        candidates
+    )
 
 
 # ============================================================
-# POISSON ENGINE
+# POISSON
 # ============================================================
 
-def poisson(k, lam):
+def poisson(
+    goals,
+    lam
+):
 
     if lam <= 0:
 
-        return 1.0 if k == 0 else 0.0
+        return (
+            1
+            if goals == 0
+            else 0
+        )
 
     return (
+
         math.exp(-lam)
+
         *
-        lam ** k
+
+        lam ** goals
+
         /
-        math.factorial(k)
+
+        math.factorial(goals)
+
     )
 
 
@@ -1023,68 +1275,91 @@ def poisson_model(
 
     matrix = {}
 
-    for home_goals in range(0, 8):
+    for h in range(8):
 
-        for away_goals in range(0, 8):
+        for a in range(8):
 
-            probability = (
+            matrix[
+                h,
+                a
+            ] = (
 
                 poisson(
-                    home_goals,
+                    h,
                     lambda_home
                 )
 
                 *
 
                 poisson(
-                    away_goals,
+                    a,
                     lambda_away
                 )
 
             )
 
-            matrix[
-                home_goals,
-                away_goals
-            ] = probability
+    probabilities = {
 
-    home = 0
-    draw = 0
-    away = 0
+        "HOME": 0,
+        "DRAW": 0,
+        "AWAY": 0,
 
-    over15 = 0
-    over25 = 0
-    over35 = 0
+        "OVER15": 0,
+        "OVER25": 0,
+        "OVER35": 0,
 
-    btts = 0
+        "BTTS": 0
+
+    }
 
     scores = []
 
     for (
-        h,
-        a
-    ), probability in matrix.items():
+        (h, a),
+        probability
+    ) in matrix.items():
 
         if h > a:
-            home += probability
+
+            probabilities[
+                "HOME"
+            ] += probability
 
         elif h == a:
-            draw += probability
+
+            probabilities[
+                "DRAW"
+            ] += probability
 
         else:
-            away += probability
+
+            probabilities[
+                "AWAY"
+            ] += probability
 
         if h + a >= 2:
-            over15 += probability
+
+            probabilities[
+                "OVER15"
+            ] += probability
 
         if h + a >= 3:
-            over25 += probability
+
+            probabilities[
+                "OVER25"
+            ] += probability
 
         if h + a >= 4:
-            over35 += probability
+
+            probabilities[
+                "OVER35"
+            ] += probability
 
         if h > 0 and a > 0:
-            btts += probability
+
+            probabilities[
+                "BTTS"
+            ] += probability
 
         scores.append(
             (
@@ -1094,29 +1369,29 @@ def poisson_model(
             )
         )
 
+    for market in probabilities:
+
+        probabilities[
+            market
+        ] *= 100
+
     scores.sort(
         reverse=True
     )
 
     return {
 
-        "HOME": home * 100,
-        "DRAW": draw * 100,
-        "AWAY": away * 100,
+        "probabilities":
+            probabilities,
 
-        "OVER15": over15 * 100,
-        "OVER25": over25 * 100,
-        "OVER35": over35 * 100,
-
-        "BTTS": btts * 100,
-
-        "scores": scores[:5]
+        "scores":
+            scores[:5]
 
     }
 
 
 # ============================================================
-# STRENGTH ENGINE
+# LAMBDA ENGINE
 # ============================================================
 
 def calculate_lambda(
@@ -1126,60 +1401,246 @@ def calculate_lambda(
     away_venue
 ):
 
-    # Attaque domicile
     home_attack = (
-        home_form["avg_gf"] * 0.45
+
+        home_form["avg_gf"]
+        * 0.40
+
         +
-        home_venue["avg_gf"] * 0.55
+
+        home_venue["avg_gf"]
+        * 0.60
+
     )
 
-    # Défense extérieure adverse
     away_defense = (
-        away_form["avg_ga"] * 0.45
+
+        away_form["avg_ga"]
+        * 0.40
+
         +
-        away_venue["avg_ga"] * 0.55
+
+        away_venue["avg_ga"]
+        * 0.60
+
     )
 
-    # Attaque extérieure
     away_attack = (
-        away_form["avg_gf"] * 0.45
+
+        away_form["avg_gf"]
+        * 0.40
+
         +
-        away_venue["avg_gf"] * 0.55
+
+        away_venue["avg_gf"]
+        * 0.60
+
     )
 
-    # Défense domicile adverse
     home_defense = (
-        home_form["avg_ga"] * 0.45
+
+        home_form["avg_ga"]
+        * 0.40
+
         +
-        home_venue["avg_ga"] * 0.55
+
+        home_venue["avg_ga"]
+        * 0.60
+
     )
 
     lambda_home = (
-        home_attack * 0.60
+
+        home_attack
+        * 0.60
+
         +
-        away_defense * 0.40
+
+        away_defense
+        * 0.40
+
+        +
+
+        0.15
+
     )
 
     lambda_away = (
-        away_attack * 0.60
+
+        away_attack
+        * 0.60
+
         +
-        home_defense * 0.40
+
+        home_defense
+        * 0.40
+
     )
 
     return (
 
         clamp(
             lambda_home,
-            0.15,
-            4.5
+            0.10,
+            4.50
         ),
 
         clamp(
             lambda_away,
-            0.15,
-            4.5
+            0.10,
+            4.50
         )
 
+    )
+
+
+# ============================================================
+# CALIBRATION V4
+# ============================================================
+
+def calibration_bucket(
+    probability
+):
+
+    probability = safe_float(
+        probability
+    )
+
+    if probability < 50:
+        return "40-49"
+
+    if probability < 60:
+        return "50-59"
+
+    if probability < 70:
+        return "60-69"
+
+    if probability < 80:
+        return "70-79"
+
+    if probability < 90:
+        return "80-89"
+
+    return "90-99"
+
+
+def get_calibration_stats():
+
+    connection = database()
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT
+            probability,
+            actual_result
+        FROM predictions
+        WHERE
+            status = 'SETTLED'
+            AND actual_result IS NOT NULL
+    """)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    buckets = defaultdict(
+        lambda: {
+            "total": 0,
+            "wins": 0,
+            "expected": []
+        }
+    )
+
+    for row in rows:
+
+        probability = safe_float(
+            row["probability"]
+        )
+
+        bucket = calibration_bucket(
+            probability
+        )
+
+        buckets[
+            bucket
+        ]["total"] += 1
+
+        buckets[
+            bucket
+        ]["expected"].append(
+            probability
+        )
+
+        if row["actual_result"] == "WIN":
+
+            buckets[
+                bucket
+            ]["wins"] += 1
+
+    return buckets
+
+
+def calibrated_probability(
+    raw_probability
+):
+
+    raw_probability = clamp(
+        raw_probability,
+        1,
+        99
+    )
+
+    buckets = get_calibration_stats()
+
+    bucket = calibration_bucket(
+        raw_probability
+    )
+
+    data = buckets.get(
+        bucket
+    )
+
+    # Pas assez d'historique :
+    # on conserve le modèle brut.
+    if not data or data["total"] < 10:
+
+        return raw_probability
+
+    observed = (
+        data["wins"]
+        /
+        data["total"]
+        *
+        100
+    )
+
+    expected = mean(
+        data["expected"],
+        raw_probability
+    )
+
+    # Correction douce.
+    correction = (
+        observed - expected
+    )
+
+    correction = clamp(
+        correction,
+        -12,
+        12
+    )
+
+    calibrated = (
+        raw_probability
+        +
+        correction * 0.65
+    )
+
+    return clamp(
+        calibrated,
+        1,
+        99
     )
 
 
@@ -1187,29 +1648,39 @@ def calculate_lambda(
 # FORM SCORE
 # ============================================================
 
-def form_score(form):
+def form_score(
+    form
+):
 
     if not form["matches"]:
+
         return 50
 
-    result = (
+    return clamp(
 
-        form["W"] * 3
-        +
-        form["D"]
+        (
+            form["W"] * 3
+            +
+            form["D"]
+        )
 
-    ) / (
+        /
 
-        form["matches"] * 3
+        (
+            form["matches"] * 3
+        )
 
-    ) * 100
+        * 100
 
-    return clamp(result)
+    )
 
 
-def venue_score(venue):
+def venue_score(
+    venue
+):
 
     if not venue["matches"]:
+
         return 50
 
     return clamp(
@@ -1235,61 +1706,81 @@ def venue_score(venue):
 # DATA QUALITY
 # ============================================================
 
-def quality_score(
+def data_quality(
     home_form,
     away_form,
     home_venue,
     away_venue,
-    h2h
+    h2h,
+    api_prediction
 ):
 
     scores = []
 
-    for obj in [
+    for data in [
         home_form,
         away_form,
         home_venue,
         away_venue
     ]:
 
-        matches = obj.get(
+        n = data.get(
             "matches",
             0
         )
 
-        if matches >= 8:
-            scores.append(100)
+        if n >= 8:
+            score = 100
 
-        elif matches >= 5:
-            scores.append(80)
+        elif n >= 5:
+            score = 80
 
-        elif matches >= 3:
-            scores.append(60)
+        elif n >= 3:
+            score = 60
 
-        elif matches > 0:
-            scores.append(40)
+        elif n >= 1:
+            score = 40
 
         else:
-            scores.append(0)
+            score = 0
 
-    h2h_matches = h2h.get(
+        scores.append(
+            score
+        )
+
+    h2h_n = h2h.get(
         "matches",
         0
     )
 
-    if h2h_matches >= 8:
+    if h2h_n >= 8:
+
         scores.append(100)
 
-    elif h2h_matches >= 5:
+    elif h2h_n >= 5:
+
         scores.append(80)
 
-    elif h2h_matches >= 3:
+    elif h2h_n >= 3:
+
         scores.append(60)
 
     else:
+
         scores.append(40)
 
-    return sum(scores) / len(scores)
+    if api_prediction:
+
+        scores.append(100)
+
+    else:
+
+        scores.append(50)
+
+    return mean(
+        scores,
+        50
+    )
 
 
 # ============================================================
@@ -1304,78 +1795,40 @@ def convergence(
 ):
 
     values = [
+
         poisson_probability,
+
         form_signal,
+
         venue_signal
+
     ]
 
     if api_probability > 0:
+
         values.append(
             api_probability
         )
 
-    average = sum(values) / len(values)
-
-    deviation = sum(
-        abs(
-            value - average
-        )
-        for value in values
-    ) / len(values)
-
-    return clamp(
-        100 - deviation
+    average = mean(
+        values
     )
 
+    dispersion = mean(
+        [
+            abs(
+                value
+                -
+                average
+            )
+            for value in values
+        ]
+    )
 
-# ============================================================
-# MARKET ENGINE
-# ============================================================
-
-def build_market_probabilities(
-    poisson,
-    home_form,
-    away_form
-):
-
-    return {
-
-        "HOME": poisson["HOME"],
-
-        "DRAW": poisson["DRAW"],
-
-        "AWAY": poisson["AWAY"],
-
-        "OVER15": poisson["OVER15"],
-
-        "OVER25": poisson["OVER25"],
-
-        "OVER35": poisson["OVER35"],
-
-        "BTTS": poisson["BTTS"]
-
-    }
-
-
-def market_name(market):
-
-    names = {
-
-        "HOME": "Victoire domicile",
-        "DRAW": "Match nul",
-        "AWAY": "Victoire extérieur",
-
-        "OVER15": "Over 1.5",
-        "OVER25": "Over 2.5",
-        "OVER35": "Over 3.5",
-
-        "BTTS": "BTTS Oui"
-
-    }
-
-    return names.get(
-        market,
-        market
+    return clamp(
+        100
+        -
+        dispersion
     )
 
 
@@ -1383,35 +1836,37 @@ def market_name(market):
 # RISK ENGINE
 # ============================================================
 
-def detect_risk(
+def detect_traps(
+    home,
+    away,
     home_form,
     away_form,
     home_venue,
     away_venue,
     h2h,
-    poisson,
-    selected_market,
-    quality
+    poisson_probs,
+    market
 ):
 
     traps = []
 
+    home_w = home_form["W"]
+    away_w = away_form["W"]
+
     favorite = None
 
     if (
-        home_form["W"] >= 6
+        home_w >= 6
         and
-        home_form["W"] >
-        away_form["W"] + 2
+        home_w > away_w + 2
     ):
 
         favorite = "HOME"
 
     elif (
-        away_form["W"] >= 6
+        away_w >= 6
         and
-        away_form["W"] >
-        home_form["W"] + 2
+        away_w > home_w + 2
     ):
 
         favorite = "AWAY"
@@ -1429,75 +1884,90 @@ def detect_risk(
         ):
 
             traps.append(
-                "Favori extérieur face à une équipe forte à domicile"
+                "Favori extérieur "
+                "face à un adversaire "
+                "fort à domicile"
             )
 
     # --------------------------------------------------------
-    # H2H contradictoire
-    # --------------------------------------------------------
-
-    if favorite == "HOME":
-
-        if (
-            h2h["matches"] >= 5
-            and
-            h2h["w2"] > h2h["w1"]
-        ):
-
-            traps.append(
-                "H2H défavorable au favori"
-            )
-
-    if favorite == "AWAY":
-
-        if (
-            h2h["matches"] >= 5
-            and
-            h2h["w1"] > h2h["w2"]
-        ):
-
-            traps.append(
-                "H2H défavorable au favori"
-            )
-
-    # --------------------------------------------------------
-    # Poisson contradictoire
+    # H2H
     # --------------------------------------------------------
 
     if (
-        selected_market == "HOME"
+        favorite == "HOME"
         and
-        poisson["HOME"] < 50
+        h2h["matches"] >= 5
+        and
+        h2h["w2"] > h2h["w1"]
     ):
 
         traps.append(
-            "Poisson ne confirme pas la victoire domicile"
+            "H2H contraire au favori"
         )
 
     if (
-        selected_market == "AWAY"
+        favorite == "AWAY"
         and
-        poisson["AWAY"] < 50
+        h2h["matches"] >= 5
+        and
+        h2h["w1"] > h2h["w2"]
     ):
 
         traps.append(
-            "Poisson ne confirme pas la victoire extérieure"
+            "H2H contraire au favori"
         )
 
     # --------------------------------------------------------
-    # Qualité faible
+    # Poisson
     # --------------------------------------------------------
 
-    if quality < 60:
+    if (
+        market == "HOME"
+        and
+        poisson_probs["HOME"] < 50
+    ):
 
         traps.append(
-            "Qualité des données insuffisante"
+            "Poisson ne confirme "
+            "pas la victoire domicile"
+        )
+
+    if (
+        market == "AWAY"
+        and
+        poisson_probs["AWAY"] < 50
+    ):
+
+        traps.append(
+            "Poisson ne confirme "
+            "pas la victoire extérieure"
+        )
+
+    # --------------------------------------------------------
+    # Match trop équilibré
+    # --------------------------------------------------------
+
+    if (
+        market in [
+            "HOME",
+            "AWAY"
+        ]
+        and
+        abs(
+            poisson_probs["HOME"]
+            -
+            poisson_probs["AWAY"]
+        ) < 8
+    ):
+
+        traps.append(
+            "Écart de force faible"
         )
 
     return traps
 
 
-def calculate_risk(
+def risk_score(
     quality,
     convergence_score,
     probability,
@@ -1506,53 +1976,171 @@ def calculate_risk(
 
     risk = (
 
-        (100 - quality) * 0.35
+        (100 - quality)
+        * 0.35
 
         +
 
-        (100 - convergence_score) * 0.30
+        (100 - convergence_score)
+        * 0.30
 
         +
 
-        (100 - probability) * 0.35
+        (100 - probability)
+        * 0.35
 
     )
 
-    risk += len(traps) * 8
+    risk += (
+        len(traps)
+        * 8
+    )
 
-    return clamp(risk)
+    return clamp(
+        risk
+    )
+
+
+# ============================================================
+# MARKET ENGINE
+# ============================================================
+
+MARKET_NAMES = {
+
+    "HOME":
+        "Victoire domicile",
+
+    "DRAW":
+        "Match nul",
+
+    "AWAY":
+        "Victoire extérieur",
+
+    "OVER15":
+        "Over 1.5",
+
+    "OVER25":
+        "Over 2.5",
+
+    "OVER35":
+        "Over 3.5",
+
+    "BTTS":
+        "BTTS Oui"
+
+}
+
+
+def market_name(
+    market
+):
+
+    return MARKET_NAMES.get(
+        market,
+        market
+    )
+
+
+def choose_market(
+    probabilities
+):
+
+    # On ne choisit pas seulement
+    # la probabilité maximale.
+    #
+    # On donne priorité aux marchés
+    # dont la probabilité est robuste.
+
+    priority = [
+
+        "OVER15",
+        "BTTS",
+        "OVER25",
+        "HOME",
+        "AWAY",
+        "OVER35",
+        "DRAW"
+
+    ]
+
+    candidates = []
+
+    for market in priority:
+
+        probability = safe_float(
+            probabilities.get(
+                market
+            )
+        )
+
+        if probability >= 55:
+
+            candidates.append(
+                (
+                    probability,
+                    market
+                )
+            )
+
+    if not candidates:
+
+        market = max(
+            probabilities,
+            key=probabilities.get
+        )
+
+        return (
+            market,
+            probabilities[market]
+        )
+
+    # Probabilité dominante.
+    candidates.sort(
+        reverse=True
+    )
+
+    return candidates[0][1], candidates[0][0]
 
 
 # ============================================================
 # VALUE ENGINE
 # ============================================================
 
-def fair_odds(probability):
+def fair_odds(
+    probability
+):
 
     if probability <= 0:
+
         return 999
 
     return 100 / probability
 
 
-def implied_probability(odd):
+def implied_probability(
+    odd
+):
 
     if not odd or odd <= 1:
+
         return 0
 
     return 100 / odd
 
 
-def calculate_value(
+def value_percentage(
     probability,
     odd
 ):
 
     if not odd or odd <= 1:
+
         return None
 
     market_probability = (
-        implied_probability(odd)
+        implied_probability(
+            odd
+        )
     )
 
     return (
@@ -1566,34 +2154,52 @@ def calculate_value(
 # DECISION ENGINE
 # ============================================================
 
-def decision_engine(
+def decision(
     score,
     risk,
     value,
     quality,
-    probability
+    probability,
+    traps
 ):
 
     if quality < 55:
+
         return "⚫ NO DATA"
 
     if probability < 55:
+
         return "🔴 PASS"
 
     if risk >= 65:
+
+        return "🔴 PASS"
+
+    # Sans cote :
+    # WATCH au lieu de BET.
+    if value is None:
+
+        if score >= MIN_SCORE:
+
+            return "🟡 WATCH"
+
         return "🔴 PASS"
 
     if (
         score >= 78
         and
-        value is not None
+        value >= MIN_VALUE
         and
-        value >= 4
+        risk < 45
     ):
 
         return "🟢 BET"
 
-    if score >= MIN_SCORE:
+    if (
+        score >= MIN_SCORE
+        and
+        value >= 0
+    ):
 
         return "🟡 WATCH"
 
@@ -1601,21 +2207,30 @@ def decision_engine(
 
 
 # ============================================================
-# COMPLETE MATCH ANALYSIS
+# COMPLETE ANALYSIS
 # ============================================================
 
-def analyze_match(match):
+def analyze_match(
+    fixture
+):
 
-    fixture_id = match["fixture"]["id"]
+    fixture_id = fixture[
+        "fixture"
+    ]["id"]
 
-    home = match["teams"]["home"]
-    away = match["teams"]["away"]
+    home = fixture[
+        "teams"
+    ]["home"]
+
+    away = fixture[
+        "teams"
+    ]["away"]
 
     home_id = home["id"]
     away_id = away["id"]
 
     logging.info(
-        "Analyse %s vs %s",
+        "Analyse : %s vs %s",
         home["name"],
         away["name"]
     )
@@ -1647,145 +2262,123 @@ def analyze_match(match):
         away_id
     )
 
+    api_prediction = get_api_prediction(
+        fixture_id
+    )
+
     # --------------------------------------------------------
-    # STRENGTH
+    # LAMBDA
     # --------------------------------------------------------
 
-    lambda_home, lambda_away = calculate_lambda(
-
-        home_form,
-        away_form,
-
-        home_venue,
-        away_venue
-
+    lambda_home, lambda_away = (
+        calculate_lambda(
+            home_form,
+            away_form,
+            home_venue,
+            away_venue
+        )
     )
 
     # --------------------------------------------------------
     # POISSON
     # --------------------------------------------------------
 
-    poisson = poisson_model(
+    poisson_result = poisson_model(
         lambda_home,
         lambda_away
     )
 
-    # --------------------------------------------------------
-    # API MODEL
-    # --------------------------------------------------------
-
-    api_prediction = get_api_prediction(
-        fixture_id
+    poisson_probs = (
+        poisson_result[
+            "probabilities"
+        ]
     )
 
     # --------------------------------------------------------
-    # MARKETS
+    # MARKET
     # --------------------------------------------------------
 
-    probabilities = build_market_probabilities(
-
-        poisson,
-
-        home_form,
-        away_form
-
+    selected_market, raw_probability = (
+        choose_market(
+            poisson_probs
+        )
     )
 
     # --------------------------------------------------------
-    # Choix du meilleur marché
-    # --------------------------------------------------------
-
-    candidates = []
-
-    for market, probability in probabilities.items():
-
-        if probability >= 55:
-
-            candidates.append(
-                (
-                    probability,
-                    market
-                )
-            )
-
-    if not candidates:
-
-        selected_probability = max(
-            probabilities.values()
-        )
-
-        selected_market = max(
-            probabilities,
-            key=probabilities.get
-        )
-
-    else:
-
-        # Priorité à la probabilité,
-        # mais on évite les marchés trop fragiles.
-        candidates.sort(
-            reverse=True
-        )
-
-        selected_probability = candidates[0][0]
-
-        selected_market = candidates[0][1]
-
-    # --------------------------------------------------------
-    # API prediction comme deuxième opinion
+    # API PROBABILITY
     # --------------------------------------------------------
 
     api_probability = 0
 
     if selected_market == "HOME":
-        api_probability = api_prediction.get(
-            "home",
-            0
+
+        api_probability = (
+            api_prediction
+            .get(
+                "home",
+                0
+            )
         )
 
     elif selected_market == "DRAW":
-        api_probability = api_prediction.get(
-            "draw",
-            0
+
+        api_probability = (
+            api_prediction
+            .get(
+                "draw",
+                0
+            )
         )
 
     elif selected_market == "AWAY":
-        api_probability = api_prediction.get(
-            "away",
-            0
+
+        api_probability = (
+            api_prediction
+            .get(
+                "away",
+                0
+            )
         )
 
     # --------------------------------------------------------
-    # Form / venue signal
+    # SIGNALS
     # --------------------------------------------------------
 
-    home_form_score = form_score(
+    home_form_signal = form_score(
         home_form
     )
 
-    away_form_score = form_score(
+    away_form_signal = form_score(
         away_form
     )
 
-    home_venue_score = venue_score(
+    home_venue_signal = venue_score(
         home_venue
     )
 
-    away_venue_score = venue_score(
+    away_venue_signal = venue_score(
         away_venue
     )
 
     if selected_market == "HOME":
 
-        form_signal = home_form_score
+        form_signal = (
+            home_form_signal
+        )
 
-        venue_signal = home_venue_score
+        venue_signal = (
+            home_venue_signal
+        )
 
     elif selected_market == "AWAY":
 
-        form_signal = away_form_score
+        form_signal = (
+            away_form_signal
+        )
 
-        venue_signal = away_venue_score
+        venue_signal = (
+            away_venue_signal
+        )
 
     elif selected_market in [
         "OVER15",
@@ -1794,37 +2387,47 @@ def analyze_match(match):
         "BTTS"
     ]:
 
-        form_signal = (
-            home_form["over25"]
-            +
-            away_form["over25"]
-        ) / 2
+        form_signal = mean(
+            [
+                home_form["over25"],
+                away_form["over25"]
+            ]
+        )
 
-        venue_signal = (
-            home_venue_score
-            +
-            away_venue_score
-        ) / 2
+        venue_signal = mean(
+            [
+                home_venue_signal,
+                away_venue_signal
+            ]
+        )
 
     else:
 
-        form_signal = 50
-        venue_signal = 50
+        form_signal = mean(
+            [
+                home_form_signal,
+                away_form_signal
+            ]
+        )
+
+        venue_signal = mean(
+            [
+                home_venue_signal,
+                away_venue_signal
+            ]
+        )
 
     # --------------------------------------------------------
     # QUALITY
     # --------------------------------------------------------
 
-    quality = quality_score(
-
+    quality = data_quality(
         home_form,
         away_form,
-
         home_venue,
         away_venue,
-
-        h2h
-
+        h2h,
+        api_prediction
     )
 
     # --------------------------------------------------------
@@ -1832,22 +2435,20 @@ def analyze_match(match):
     # --------------------------------------------------------
 
     convergence_score = convergence(
-
-        selected_probability,
-
+        raw_probability,
         api_probability,
-
         form_signal,
-
         venue_signal
-
     )
 
     # --------------------------------------------------------
-    # RISKS
+    # TRAPS
     # --------------------------------------------------------
 
-    traps = detect_risk(
+    traps = detect_traps(
+
+        home,
+        away,
 
         home_form,
         away_form,
@@ -1857,19 +2458,32 @@ def analyze_match(match):
 
         h2h,
 
-        poisson,
+        poisson_probs,
 
-        selected_market,
-
-        quality
+        selected_market
 
     )
 
-    risk = calculate_risk(
+    # --------------------------------------------------------
+    # CALIBRATION V4
+    # --------------------------------------------------------
+
+    calibrated = calibrated_probability(
+        raw_probability
+    )
+
+    # --------------------------------------------------------
+    # RISK
+    # --------------------------------------------------------
+
+    risk = risk_score(
 
         quality,
+
         convergence_score,
-        selected_probability,
+
+        calibrated,
+
         traps
 
     )
@@ -1880,33 +2494,40 @@ def analyze_match(match):
 
     score = (
 
-        selected_probability * 0.35
+        calibrated
+        * 0.35
 
         +
 
-        convergence_score * 0.20
+        convergence_score
+        * 0.20
 
         +
 
-        quality * 0.20
+        quality
+        * 0.20
 
         +
 
-        (100 - risk) * 0.15
+        (100 - risk)
+        * 0.15
 
         +
 
-        form_signal * 0.10
+        form_signal
+        * 0.10
 
     )
 
-    score = clamp(score)
+    score = clamp(
+        score
+    )
 
     # --------------------------------------------------------
     # ODDS
     # --------------------------------------------------------
 
-    odds = get_prematch_odds(
+    odds = get_odds(
         fixture_id
     )
 
@@ -1915,118 +2536,285 @@ def analyze_match(match):
         selected_market
     )
 
-    value = calculate_value(
-        selected_probability,
+    value = value_percentage(
+        calibrated,
         odd
     )
-
-    if value is None:
-        value_for_score = -10
-    else:
-        value_for_score = value
 
     # --------------------------------------------------------
     # DECISION
     # --------------------------------------------------------
 
-    decision = decision_engine(
+    final_decision = decision(
 
         score,
+
         risk,
+
         value,
+
         quality,
-        selected_probability
+
+        calibrated,
+
+        traps
 
     )
 
     # --------------------------------------------------------
-    # SCORES
+    # TOP SCORES
     # --------------------------------------------------------
 
     top_scores = []
 
-    for probability, h, a in poisson["scores"][:3]:
+    for probability, h, a in (
+        poisson_result["scores"][:3]
+    ):
 
         top_scores.append(
             {
-                "score": f"{h}-{a}",
-                "probability": probability * 100
+                "score":
+                    f"{h}-{a}",
+
+                "probability":
+                    probability * 100
             }
         )
 
     kickoff = datetime.fromtimestamp(
-        match["fixture"]["timestamp"],
+        fixture["fixture"]["timestamp"],
         TZ
     ).isoformat()
 
-    result = {
+    return {
 
-        "fixture_id": fixture_id,
+        "fixture_id":
+            fixture_id,
 
-        "home": home["name"],
-        "away": away["name"],
+        "home":
+            home["name"],
 
-        "kickoff": kickoff,
+        "away":
+            away["name"],
 
-        "market": selected_market,
+        "kickoff":
+            kickoff,
 
-        "market_name": market_name(
-            selected_market
-        ),
+        "market":
+            selected_market,
 
-        "probability": selected_probability,
+        "market_name":
+            market_name(
+                selected_market
+            ),
 
-        "fair_odds": fair_odds(
-            selected_probability
-        ),
+        "probability":
+            calibrated,
 
-        "odd": odd,
+        "raw_probability":
+            raw_probability,
 
-        "value": (
-            value
-            if value is not None
-            else -999
-        ),
+        "fair_odds":
+            fair_odds(
+                calibrated
+            ),
 
-        "score": score,
+        "odd":
+            odd,
 
-        "risk": risk,
+        "value":
+            value,
 
-        "convergence": convergence_score,
+        "score":
+            score,
 
-        "quality": quality,
+        "risk":
+            risk,
 
-        "lambda_home": lambda_home,
-        "lambda_away": lambda_away,
+        "convergence":
+            convergence_score,
 
-        "poisson": poisson,
+        "quality":
+            quality,
 
-        "api_prediction": api_prediction,
+        "lambda_home":
+            lambda_home,
 
-        "home_form": home_form,
-        "away_form": away_form,
+        "lambda_away":
+            lambda_away,
 
-        "home_venue": home_venue,
-        "away_venue": away_venue,
+        "poisson":
+            poisson_probs,
 
-        "h2h": h2h,
+        "api_prediction":
+            api_prediction,
 
-        "traps": traps,
+        "home_form":
+            home_form,
 
-        "top_scores": top_scores,
+        "away_form":
+            away_form,
 
-        "decision": decision
+        "home_venue":
+            home_venue,
+
+        "away_venue":
+            away_venue,
+
+        "h2h":
+            h2h,
+
+        "traps":
+            traps,
+
+        "top_scores":
+            top_scores,
+
+        "decision":
+            final_decision,
+
+        "model_version":
+            MODEL_VERSION
 
     }
 
-    return result
+
+# ============================================================
+# SAVE PREDICTION
+# ============================================================
+
+def save_prediction(
+    analysis
+):
+
+    connection = database()
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO predictions (
+
+            fixture_id,
+
+            created_at,
+
+            kickoff,
+
+            home,
+
+            away,
+
+            market,
+
+            market_name,
+
+            probability,
+
+            raw_probability,
+
+            calibrated_probability,
+
+            fair_odds,
+
+            bookmaker_odds,
+
+            value,
+
+            score,
+
+            risk,
+
+            convergence,
+
+            quality,
+
+            lambda_home,
+
+            lambda_away,
+
+            prediction,
+
+            decision,
+
+            model_version,
+
+            status
+
+        )
+
+        VALUES (
+
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, 'PENDING'
+
+        )
+    """, (
+
+        analysis["fixture_id"],
+
+        now().isoformat(),
+
+        analysis["kickoff"],
+
+        analysis["home"],
+
+        analysis["away"],
+
+        analysis["market"],
+
+        analysis["market_name"],
+
+        analysis["probability"],
+
+        analysis["raw_probability"],
+
+        analysis["probability"],
+
+        analysis["fair_odds"],
+
+        analysis["odd"],
+
+        (
+            analysis["value"]
+            if analysis["value"]
+            is not None
+            else None
+        ),
+
+        analysis["score"],
+
+        analysis["risk"],
+
+        analysis["convergence"],
+
+        analysis["quality"],
+
+        analysis["lambda_home"],
+
+        analysis["lambda_away"],
+
+        analysis["market"],
+
+        analysis["decision"],
+
+        MODEL_VERSION
+
+    ))
+
+    connection.commit()
+
+    connection.close()
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram(text):
+def telegram(
+    text
+):
 
     if not TG_TOKEN or not TG_CHAT:
 
@@ -2040,18 +2828,24 @@ def telegram(text):
 
         response = requests.post(
 
-            f"https://api.telegram.org/bot"
-            f"{TG_TOKEN}/sendMessage",
+            (
+                "https://api.telegram.org/"
+                f"bot{TG_TOKEN}/sendMessage"
+            ),
 
             data={
 
-                "chat_id": TG_CHAT,
+                "chat_id":
+                    TG_CHAT,
 
-                "text": text,
+                "text":
+                    text,
 
-                "parse_mode": "HTML",
+                "parse_mode":
+                    "HTML",
 
-                "disable_web_page_preview": True
+                "disable_web_page_preview":
+                    True
 
             },
 
@@ -2059,12 +2853,21 @@ def telegram(text):
 
         )
 
-        return response.status_code == 200
+        if response.status_code != 200:
+
+            logging.warning(
+                "Telegram HTTP %s",
+                response.status_code
+            )
+
+            return False
+
+        return True
 
     except Exception as e:
 
         logging.error(
-            "Telegram error: %s",
+            "Telegram ERROR : %s",
             e
         )
 
@@ -2072,17 +2875,27 @@ def telegram(text):
 
 
 # ============================================================
-# FORMAT PRE-MATCH
+# PREMATCH FORMAT
 # ============================================================
 
-def format_analysis(a):
+def format_analysis(
+    a
+):
 
     kickoff = datetime.fromisoformat(
         a["kickoff"]
     ).strftime("%H:%M")
 
+    value = a["value"]
+
+    value_text = (
+        f"{value:+.1f}%"
+        if value is not None
+        else "N/A"
+    )
+
     text = f"""
-<b>🕯️ AGENT PRO V3</b>
+<b>🕯️ AGENT PRO V4</b>
 <b>LA BOUGIE DU PARIEUR</b>
 
 ⏰ {kickoff}
@@ -2093,69 +2906,68 @@ def format_analysis(a):
 
 <b>🎯 PRONOSTIC</b>
 
-{a["market_name"]}
+<b>{a["market_name"]}</b>
 
-Probabilité :
+Probabilité brute :
+{a["raw_probability"]:.1f}%
+
+Probabilité calibrée :
 <b>{a["probability"]:.1f}%</b>
 
 Cote juste :
 <b>{a["fair_odds"]:.2f}</b>
-"""
 
-    if a["odd"]:
-
-        text += f"""
-Cote bookmaker :
-<b>{a["odd"]:.2f}</b>
+Cote disponible :
+<b>{
+    f"{a['odd']:.2f}"
+    if a["odd"]
+    else "N/A"
+}</b>
 
 Value :
-<b>{a["value"]:+.1f}%</b>
-"""
+<b>{value_text}</b>
 
-    else:
-
-        text += """
-Cote bookmaker :
-<b>indisponible</b>
-"""
-
-    text += f"""
 ━━━━━━━━━━━━━━━━━━
 
 <b>🧠 MOTEUR</b>
 
-🧮 Poisson :
-{a["poisson"]["HOME"]:.1f}% / \
-{a["poisson"]["DRAW"]:.1f}% / \
-{a["poisson"]["AWAY"]:.1f}%
+Poisson :
 
-⚽ Over 1.5 :
+🏠 {a["poisson"]["HOME"]:.1f}%
+🤝 {a["poisson"]["DRAW"]:.1f}%
+✈️ {a["poisson"]["AWAY"]:.1f}%
+
+Over 1.5 :
 {a["poisson"]["OVER15"]:.1f}%
 
-⚽ Over 2.5 :
+Over 2.5 :
 {a["poisson"]["OVER25"]:.1f}%
 
-🤝 BTTS :
+Over 3.5 :
+{a["poisson"]["OVER35"]:.1f}%
+
+BTTS :
 {a["poisson"]["BTTS"]:.1f}%
 
 λ :
-{a["lambda_home"]:.2f} - \
+{a["lambda_home"]:.2f}
+-
 {a["lambda_away"]:.2f}
 
 ━━━━━━━━━━━━━━━━━━
 
 <b>🕯️ BOUGIE</b>
 
-🎯 Score :
+Score :
 <b>{a["score"]:.0f}/100</b>
 
-⚠️ Risque :
+Risque :
 <b>{a["risk"]:.0f}/100</b>
 
-🔗 Convergence :
+Convergence :
 <b>{a["convergence"]:.0f}/100</b>
 
-📚 Données :
+Qualité données :
 <b>{a["quality"]:.0f}/100</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -2166,91 +2978,115 @@ Cote bookmaker :
     for item in a["top_scores"]:
 
         text += (
-            f'• {item["score"]} — '
-            f'{item["probability"]:.1f}%\n'
+
+            f'\n• '
+            f'{item["score"]} '
+            f'→ '
+            f'{item["probability"]:.1f}%'
+
         )
 
     if a["traps"]:
 
-        text += "\n<b>🚨 RISQUES</b>\n"
+        text += (
+            "\n\n<b>🚨 ALERTES</b>"
+        )
 
         for trap in a["traps"]:
 
             text += (
-                f"• {trap}\n"
+                f"\n• {trap}"
             )
 
     text += f"""
+
 ━━━━━━━━━━━━━━━━━━
 
-<b>🤖 DÉCISION :
+<b>DÉCISION :
 {a["decision"]}</b>
 
-<i>Probabilité ≠ garantie.</i>
+🤖 Modèle :
+{MODEL_VERSION}
+
+<i>
+Le bot mesure une probabilité,
+pas une certitude.
+</i>
 """
 
     return text
 
 
 # ============================================================
-# PRE-MATCH ENGINE
+# PREMATCH ENGINE
 # ============================================================
 
-def run_pre_match():
+def run_prematch():
 
-    fixtures = get_upcoming()
+    fixtures = (
+        get_upcoming_fixtures()
+    )
 
     if not fixtures:
 
         logging.info(
-            "Aucun match disponible"
+            "Aucun match à analyser."
         )
 
         return
 
-    candidates = fixtures[
+    fixtures = fixtures[
         :MAX_CANDIDATES
     ]
 
     analyses = []
 
-    for match in candidates:
+    for fixture in fixtures:
 
         try:
 
-            result = analyze_match(
-                match
+            analysis = analyze_match(
+                fixture
             )
 
             analyses.append(
-                result
+                analysis
             )
 
-            time.sleep(0.3)
+            save_prediction(
+                analysis
+            )
 
-        except Exception as e:
+            time.sleep(0.5)
+
+        except Exception:
 
             logging.exception(
-                "Analyse match : %s",
-                e
+                "Erreur analyse"
             )
 
     if not analyses:
+
         return
 
     # --------------------------------------------------------
-    # Classement intelligent
+    # Classement
     # --------------------------------------------------------
 
     analyses.sort(
 
         key=lambda a: (
 
-            a["decision"] == "🟢 BET",
+            a["decision"]
+            == "🟢 BET",
 
             a["score"],
 
-            a["value"]
+            (
+                a["value"]
+                if a["value"] is not None
+                else -999
+            )
 
         ),
 
@@ -2258,36 +3094,46 @@ def run_pre_match():
 
     )
 
-    top = analyses[:7]
+    selected = [
+        a
+        for a in analyses
+        if a["decision"]
+        in [
+            "🟢 BET",
+            "🟡 WATCH"
+        ]
+    ]
+
+    # --------------------------------------------------------
+    # Briefing
+    # --------------------------------------------------------
 
     message = f"""
-<b>🕯️ AGENT PRO V3 — BRIEFING</b>
+<b>🕯️ AGENT PRO V4</b>
+<b>BRIEFING DU JOUR</b>
 
 📅 {now().strftime("%d/%m/%Y")}
 ⏰ {now().strftime("%H:%M")}
 
-<b>Architecture :</b>
+Matchs analysés :
+<b>{len(analyses)}</b>
 
-DATA
-→ POISSON
-→ VALUE
-→ RISQUE
-→ CONVERGENCE
-→ DÉCISION
+Opportunités :
+<b>{len(selected)}</b>
 
 ━━━━━━━━━━━━━━━━━━
-
-<b>🏆 TOP DU JOUR</b>
 """
 
     for index, a in enumerate(
-        top,
+        analyses[:7],
         1
     ):
 
+        value = a["value"]
+
         value_text = (
-            f"{a['value']:+.1f}%"
-            if a["value"] != -999
+            f"{value:+.1f}%"
+            if value is not None
             else "N/A"
         )
 
@@ -2296,6 +3142,7 @@ DATA
 <b>{index}. {a["home"]} vs {a["away"]}</b>
 
 🎯 {a["market_name"]}
+
 📊 {a["probability"]:.1f}%
 🕯️ {a["score"]:.0f}/100
 ⚠️ {a["risk"]:.0f}/100
@@ -2308,10 +3155,24 @@ DATA
 
 ━━━━━━━━━━━━━━━━━━
 
-<i>Le système peut analyser beaucoup
-de matchs et décider de n'en retenir
-aucun lorsque le rapport probabilité /
-risque / valeur est insuffisant.</i>
+<b>Architecture V4</b>
+
+DATA
+→ POISSON
+→ CALIBRATION
+→ VALUE
+→ RISK
+→ CONVERGENCE
+→ DECISION
+→ LIVE
+→ RESULT
+→ APPRENTISSAGE
+
+<i>
+Aucun pari n'est garanti.
+Le système peut volontairement
+recommander PASS.
+</i>
 """
 
     telegram(
@@ -2319,28 +3180,21 @@ risque / valeur est insuffisant.</i>
     )
 
     # --------------------------------------------------------
-    # Sauvegarde
+    # Détails uniquement pour
+    # les meilleures opportunités.
     # --------------------------------------------------------
 
-    for a in analyses:
+    for analysis in analyses[:5]:
 
-        save_prediction(
-            a
-        )
-
-    # --------------------------------------------------------
-    # Détails des meilleurs
-    # --------------------------------------------------------
-
-    for a in top:
-
-        if a["decision"] in [
+        if analysis["decision"] in [
             "🟢 BET",
             "🟡 WATCH"
         ]:
 
             telegram(
-                format_analysis(a)
+                format_analysis(
+                    analysis
+                )
             )
 
             time.sleep(1)
@@ -2350,70 +3204,51 @@ risque / valeur est insuffisant.</i>
 # LIVE STATISTICS
 # ============================================================
 
-def parse_statistics(
+def get_live_statistics(
     fixture_id
 ):
 
     data = api(
-
         "/fixtures/statistics",
-
         {
-            "fixture": fixture_id
+            "fixture":
+                fixture_id
         },
-
         ttl=45
-
     )
 
-    result = {
-
-        "home": {},
-        "away": {}
-
-    }
+    result = {}
 
     for team_block in data:
 
-        team = team_block.get(
-            "team",
-            {}
+        team_id = (
+            team_block
+            .get("team", {})
+            .get("id")
         )
 
-        team_id = team.get(
-            "id"
-        )
+        if not team_id:
+            continue
 
-        side = None
-
-        # Le nom du côté sera associé plus tard.
-        # On conserve l'ID.
         result[
             str(team_id)
         ] = {}
 
-        for stat in team_block.get(
-            "statistics",
-            []
+        for statistic in (
+            team_block
+            .get(
+                "statistics",
+                []
+            )
         ):
 
-            name = stat.get(
+            name = statistic.get(
                 "type"
             )
 
-            value = stat.get(
+            value = statistic.get(
                 "value"
             )
-
-            if isinstance(
-                value,
-                str
-            ):
-
-                value = value.replace(
-                    "%",
-                    ""
-                )
 
             result[
                 str(team_id)
@@ -2425,7 +3260,7 @@ def parse_statistics(
 
 
 # ============================================================
-# LIVE SNAPSHOT
+# SAVE LIVE SNAPSHOT
 # ============================================================
 
 def save_live_snapshot(
@@ -2433,36 +3268,47 @@ def save_live_snapshot(
     stats
 ):
 
-    fixture_id = fixture["fixture"]["id"]
+    fixture_id = (
+        fixture["fixture"]["id"]
+    )
 
-    home_id = fixture[
-        "teams"
-    ]["home"]["id"]
+    home_id = (
+        fixture["teams"]
+        ["home"]["id"]
+    )
 
-    away_id = fixture[
-        "teams"
-    ]["away"]["id"]
+    away_id = (
+        fixture["teams"]
+        ["away"]["id"]
+    )
 
-    h = stats.get(
+    home_stats = stats.get(
         str(home_id),
         {}
     )
 
-    a = stats.get(
+    away_stats = stats.get(
         str(away_id),
         {}
     )
 
-    connection = db()
+    minute = safe_int(
+        fixture["fixture"]
+        ["status"]
+        .get("elapsed")
+    )
+
+    connection = database()
 
     cursor = connection.cursor()
 
     cursor.execute("""
-
         INSERT INTO live_snapshots (
 
             fixture_id,
+
             timestamp,
+
             minute,
 
             home_goals,
@@ -2482,19 +3328,17 @@ def save_live_snapshot(
 
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
+        VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
+        )
     """, (
 
         fixture_id,
 
         now().isoformat(),
 
-        safe_int(
-            fixture["fixture"]["status"].get(
-                "elapsed"
-            )
-        ),
+        minute,
 
         safe_int(
             fixture["goals"]["home"]
@@ -2504,42 +3348,42 @@ def save_live_snapshot(
             fixture["goals"]["away"]
         ),
 
-        h.get(
+        home_stats.get(
             "Ball Possession",
             0
         ),
 
-        a.get(
+        away_stats.get(
             "Ball Possession",
             0
         ),
 
-        h.get(
+        home_stats.get(
             "Total Shots",
             0
         ),
 
-        a.get(
+        away_stats.get(
             "Total Shots",
             0
         ),
 
-        h.get(
+        home_stats.get(
             "Shots on Goal",
             0
         ),
 
-        a.get(
+        away_stats.get(
             "Shots on Goal",
             0
         ),
 
-        h.get(
+        home_stats.get(
             "Corner Kicks",
             0
         ),
 
-        a.get(
+        away_stats.get(
             "Corner Kicks",
             0
         )
@@ -2547,50 +3391,35 @@ def save_live_snapshot(
     ))
 
     connection.commit()
+
     connection.close()
 
 
 # ============================================================
-# LIVE ENGINE
+# LIVE PROBABILITY ENGINE
 # ============================================================
 
-def live_probability_adjustment(
-    base_analysis,
+def live_adjustment(
+    prediction,
     fixture,
     stats
 ):
 
-    probability = base_analysis[
-        "probability"
-    ]
-
-    fixture_id = fixture[
-        "fixture"
-    ]["id"]
-
-    home_id = fixture[
-        "teams"
-    ]["home"]["id"]
-
-    away_id = fixture[
-        "teams"
-    ]["away"]["id"]
-
-    home_stats = stats.get(
-        str(home_id),
-        {}
+    base_probability = safe_float(
+        prediction["probability"]
     )
 
-    away_stats = stats.get(
-        str(away_id),
-        {}
+    market = prediction[
+        "market"
+    ]
 
+    fixture_status = (
+        fixture["fixture"]
+        ["status"]
     )
 
     minute = safe_int(
-        fixture[
-            "fixture"
-        ]["status"].get(
+        fixture_status.get(
             "elapsed"
         )
     )
@@ -2603,113 +3432,211 @@ def live_probability_adjustment(
         fixture["goals"]["away"]
     )
 
-    # --------------------------------------------------------
-    # Ajustement basé sur tirs cadrés
-    # --------------------------------------------------------
+    home_id = (
+        fixture["teams"]
+        ["home"]["id"]
+    )
 
-    h_target = safe_float(
-        home_stats.get(
+    away_id = (
+        fixture["teams"]
+        ["away"]["id"]
+    )
+
+    hs = stats.get(
+        str(home_id),
+        {}
+    )
+
+    aws = stats.get(
+        str(away_id),
+        {}
+    )
+
+    home_target = safe_float(
+        hs.get(
             "Shots on Goal"
         )
     )
 
-    a_target = safe_float(
-        away_stats.get(
+    away_target = safe_float(
+        aws.get(
             "Shots on Goal"
         )
     )
 
-    target_total = (
-        h_target
-        +
-        a_target
+    home_shots = safe_float(
+        hs.get(
+            "Total Shots"
+        )
     )
 
-    # --------------------------------------------------------
-    # Ajustement rythme
-    # --------------------------------------------------------
+    away_shots = safe_float(
+        aws.get(
+            "Total Shots"
+        )
+    )
 
     adjustment = 0
-
-    if target_total >= 8:
-        adjustment += 6
-
-    elif target_total >= 5:
-        adjustment += 3
-
-    elif target_total <= 1 and minute >= 45:
-        adjustment -= 5
 
     # --------------------------------------------------------
     # Score
     # --------------------------------------------------------
 
-    if base_analysis["market"] == "HOME":
+    if market == "HOME":
 
         if hg > ag:
-            adjustment += 8
 
-        elif hg < ag:
-            adjustment -= 12
-
-    elif base_analysis["market"] == "AWAY":
-
-        if ag > hg:
-            adjustment += 8
-
-        elif ag < hg:
-            adjustment -= 12
-
-    elif base_analysis["market"] in [
-        "OVER15",
-        "OVER25",
-        "OVER35"
-    ]:
-
-        total_goals = hg + ag
-
-        if total_goals >= 2:
             adjustment += 10
 
-        elif total_goals == 1 and minute < 60:
-            adjustment += 3
+        elif hg < ag:
 
-        elif total_goals == 0 and minute >= 60:
-            adjustment -= 12
+            adjustment -= 15
 
-    elif base_analysis["market"] == "BTTS":
+    elif market == "AWAY":
+
+        if ag > hg:
+
+            adjustment += 10
+
+        elif ag < hg:
+
+            adjustment -= 15
+
+    elif market == "BTTS":
 
         if hg > 0 and ag > 0:
+
             adjustment += 15
 
         elif (
             minute >= 70
             and
-            (hg == 0 or ag == 0)
+            (
+                hg == 0
+                or
+                ag == 0
+            )
+        ):
+
+            adjustment -= 18
+
+    elif market == "OVER15":
+
+        if hg + ag >= 2:
+
+            adjustment += 12
+
+        elif (
+            minute >= 70
+            and
+            hg + ag == 0
         ):
 
             adjustment -= 15
 
+    elif market == "OVER25":
+
+        if hg + ag >= 3:
+
+            adjustment += 15
+
+        elif (
+            minute >= 70
+            and
+            hg + ag < 2
+        ):
+
+            adjustment -= 15
+
+    elif market == "OVER35":
+
+        if hg + ag >= 4:
+
+            adjustment += 15
+
+        elif (
+            minute >= 70
+            and
+            hg + ag < 3
+        ):
+
+            adjustment -= 15
+
+    # --------------------------------------------------------
+    # Intensité
+    # --------------------------------------------------------
+
+    shots_target = (
+        home_target
+        +
+        away_target
+    )
+
+    total_shots = (
+        home_shots
+        +
+        away_shots
+    )
+
+    if shots_target >= 8:
+
+        adjustment += 6
+
+    elif shots_target >= 5:
+
+        adjustment += 3
+
+    elif (
+        shots_target <= 1
+        and
+        minute >= 45
+    ):
+
+        adjustment -= 5
+
+    if total_shots >= 20:
+
+        adjustment += 3
+
+    # --------------------------------------------------------
+    # Fatigue temporelle
+    # --------------------------------------------------------
+
+    if minute >= 80:
+
+        adjustment *= 1.15
+
     live_probability = clamp(
-        probability + adjustment,
+
+        base_probability
+        +
+        adjustment,
+
         1,
         99
+
     )
 
     return live_probability
 
 
+# ============================================================
+# LIVE ALERT ENGINE
+# ============================================================
+
 def live_update(
     fixture
 ):
 
-    fixture_id = fixture[
-        "fixture"
-    ]["id"]
+    fixture_id = (
+        fixture["fixture"]["id"]
+    )
 
-    status = fixture[
-        "fixture"
-    ]["status"]["short"]
+    status = (
+        fixture["fixture"]
+        ["status"]
+        ["short"]
+    )
 
     if status not in [
         "1H",
@@ -2720,33 +3647,31 @@ def live_update(
 
         return
 
-    connection = db()
+    connection = database()
 
     cursor = connection.cursor()
 
     cursor.execute("""
-
         SELECT *
-
         FROM predictions
-
         WHERE fixture_id = ?
-
     """, (
         fixture_id,
     ))
 
-    row = cursor.fetchone()
+    prediction = cursor.fetchone()
 
     connection.close()
 
-    if not row:
+    if not prediction:
 
         return
 
-    base_analysis = dict(row)
+    prediction = dict(
+        prediction
+    )
 
-    stats = parse_statistics(
+    stats = get_live_statistics(
         fixture_id
     )
 
@@ -2755,22 +3680,18 @@ def live_update(
         stats
     )
 
-    live_probability = live_probability_adjustment(
-        base_analysis,
-        fixture,
-        stats
-    )
-
-    old = LIVE_STATE.get(
-        fixture_id
+    live_probability = (
+        live_adjustment(
+            prediction,
+            fixture,
+            stats
+        )
     )
 
     minute = safe_int(
-        fixture[
-            "fixture"
-        ]["status"].get(
-            "elapsed"
-        )
+        fixture["fixture"]
+        ["status"]
+        .get("elapsed")
     )
 
     hg = safe_int(
@@ -2781,15 +3702,23 @@ def live_update(
         fixture["goals"]["away"]
     )
 
+    previous = LIVE_STATE.get(
+        fixture_id
+    )
+
     current = {
 
-        "minute": minute,
+        "minute":
+            minute,
 
-        "home_goals": hg,
+        "home_goals":
+            hg,
 
-        "away_goals": ag,
+        "away_goals":
+            ag,
 
-        "probability": live_probability
+        "probability":
+            live_probability
 
     }
 
@@ -2798,27 +3727,27 @@ def live_update(
     ] = current
 
     # --------------------------------------------------------
-    # Première détection
+    # Première entrée
     # --------------------------------------------------------
 
-    if old is None:
+    if previous is None:
 
         telegram(f"""
-<b>🔴 LIVE ACTIVÉ</b>
+<b>🔴 LIVE — AGENT PRO V4</b>
 
-⚽ <b>{base_analysis["home"]}
+⚽ <b>{prediction["home"]}
 {hg} - {ag}
-{base_analysis["away"]}</b>
+{prediction["away"]}</b>
 
 ⏱️ {minute}'
 
-🎯 Marché initial :
-<b>{base_analysis["market"]}</b>
+🎯 Marché :
+<b>{prediction["market_name"]}</b>
 
-📊 Probabilité initiale :
-{base_analysis["probability"]:.1f}%
+📊 Probabilité :
+<b>{live_probability:.1f}%</b>
 
-📡 Surveillance statistique activée.
+📡 Surveillance activée.
 """)
 
         return
@@ -2827,43 +3756,50 @@ def live_update(
     # BUT
     # --------------------------------------------------------
 
-    if (
-        old["home_goals"] != hg
+    goal_changed = (
+
+        previous["home_goals"]
+        != hg
+
         or
-        old["away_goals"] != ag
-    ):
+
+        previous["away_goals"]
+        != ag
+
+    )
+
+    if goal_changed:
 
         telegram(f"""
 <b>⚡ BUT — AGENT PRO LIVE</b>
 
-⚽ <b>{base_analysis["home"]}
+⚽ <b>{prediction["home"]}
 {hg} - {ag}
-{base_analysis["away"]}</b>
+{prediction["away"]}</b>
 
 ⏱️ {minute}'
 
-🎯 Marché :
-{base_analysis["market"]}
+🎯 {prediction["market_name"]}
 
-📊 Nouvelle probabilité :
+📊 Probabilité LIVE :
 <b>{live_probability:.1f}%</b>
 """)
 
     # --------------------------------------------------------
-    # Changement important de probabilité
+    # Gros mouvement
     # --------------------------------------------------------
 
-    probability_change = (
+    change = (
         live_probability
         -
-        old["probability"]
+        previous["probability"]
     )
 
-    if abs(probability_change) >= 8:
+    if abs(change) >= 8:
 
         direction = (
             "📈 RENFORCEMENT"
-            if probability_change > 0
+            if change > 0
             else
             "📉 DÉGRADATION"
         )
@@ -2871,9 +3807,9 @@ def live_update(
         telegram(f"""
 <b>🕯️ BOUGIE LIVE</b>
 
-⚽ {base_analysis["home"]}
+⚽ {prediction["home"]}
 <b>{hg}-{ag}</b>
-{base_analysis["away"]}
+{prediction["away"]}
 
 ⏱️ {minute}'
 
@@ -2883,37 +3819,56 @@ Probabilité :
 <b>{live_probability:.1f}%</b>
 
 Variation :
-{probability_change:+.1f} points
+{change:+.1f} points
 
-🎯 Marché :
-{base_analysis["market"]}
+🎯 {prediction["market_name"]}
 """)
 
     # --------------------------------------------------------
-    # Update périodique
+    # Rapport toutes les 15 minutes
     # --------------------------------------------------------
 
-    if minute > 0 and minute % 15 == 0:
+    if (
+        minute > 0
+        and
+        minute % 15 == 0
+        and
+        (
+            fixture_id
+            not in LAST_TELEGRAM
+            or
+            LAST_TELEGRAM[
+                fixture_id
+            ] != minute
+        )
+    ):
+
+        LAST_TELEGRAM[
+            fixture_id
+        ] = minute
 
         telegram(f"""
-<b>📡 RAPPORT LIVE</b>
+<b>📡 RAPPORT LIVE V4</b>
 
-⚽ {base_analysis["home"]}
+⚽ {prediction["home"]}
 <b>{hg}-{ag}</b>
-{base_analysis["away"]}
+{prediction["away"]}
 
 ⏱️ {minute}'
 
-🎯 {base_analysis["market"]}
+🎯 {prediction["market_name"]}
 
-Avant :
-{base_analysis["probability"]:.1f}%
+Pré-match :
+{prediction["probability"]:.1f}%
 
 LIVE :
 <b>{live_probability:.1f}%</b>
 
+Variation :
+{change:+.1f}
+
 🕯️ Score initial :
-{base_analysis["score"]:.0f}/100
+{prediction["score"]:.0f}/100
 """)
 
 
@@ -2923,9 +3878,9 @@ LIVE :
 
 def run_live():
 
-    matches = get_live()
+    fixtures = get_live_fixtures()
 
-    for fixture in matches:
+    for fixture in fixtures:
 
         try:
 
@@ -2933,11 +3888,10 @@ def run_live():
                 fixture
             )
 
-        except Exception as e:
+        except Exception:
 
             logging.exception(
-                "LIVE ERROR : %s",
-                e
+                "LIVE ERROR"
             )
 
 
@@ -2945,71 +3899,111 @@ def run_live():
 # RESULT ENGINE
 # ============================================================
 
-def settle_finished_predictions():
+def market_won(
+    market,
+    hg,
+    ag
+):
 
-    connection = db()
+    if market == "HOME":
+
+        return hg > ag
+
+    if market == "DRAW":
+
+        return hg == ag
+
+    if market == "AWAY":
+
+        return ag > hg
+
+    if market == "OVER15":
+
+        return hg + ag >= 2
+
+    if market == "OVER25":
+
+        return hg + ag >= 3
+
+    if market == "OVER35":
+
+        return hg + ag >= 4
+
+    if market == "BTTS":
+
+        return (
+            hg > 0
+            and
+            ag > 0
+        )
+
+    return False
+
+
+def settle_predictions():
+
+    connection = database()
 
     cursor = connection.cursor()
 
     cursor.execute("""
-
         SELECT *
-
         FROM predictions
-
         WHERE status = 'PENDING'
-
     """)
 
     predictions = cursor.fetchall()
 
     connection.close()
 
-    if not predictions:
-        return
-
     for prediction in predictions:
-
-        kickoff = prediction[
-            "kickoff"
-        ]
 
         try:
 
-            kickoff_dt = datetime.fromisoformat(
-                kickoff
+            kickoff = datetime.fromisoformat(
+                prediction["kickoff"]
             )
 
-        except:
+        except Exception:
 
             continue
 
-        if now() < kickoff_dt + timedelta(
-            minutes=130
+        if (
+            now()
+            <
+            kickoff
+            +
+            timedelta(
+                minutes=140
+            )
         ):
 
             continue
 
-        fixture_id = prediction[
-            "fixture_id"
-        ]
+        fixture_id = (
+            prediction["fixture_id"]
+        )
 
-        data = api(
+        fixtures = api(
             "/fixtures",
             {
-                "id": fixture_id
+                "id":
+                    fixture_id
             },
             ttl=60
         )
 
-        if not data:
+        if not fixtures:
+
             continue
 
-        fixture = data[0]
+        fixture = fixtures[0]
 
-        status = fixture[
-            "fixture"
-        ]["status"]["short"]
+        status = (
+            fixture["fixture"]
+            ["status"]
+            ["short"]
+        )
 
         if status not in [
             "FT",
@@ -3027,43 +4021,29 @@ def settle_finished_predictions():
             fixture["goals"]["away"]
         )
 
-        market = prediction[
-            "market"
-        ]
+        won = market_won(
 
-        won = False
+            prediction["market"],
 
-        if market == "HOME":
-            won = hg > ag
+            hg,
 
-        elif market == "DRAW":
-            won = hg == ag
+            ag
 
-        elif market == "AWAY":
-            won = ag > hg
+        )
 
-        elif market == "OVER15":
-            won = hg + ag >= 2
+        odd = safe_float(
+            prediction[
+                "bookmaker_odds"
+            ]
+        )
 
-        elif market == "OVER25":
-            won = hg + ag >= 3
-
-        elif market == "OVER35":
-            won = hg + ag >= 4
-
-        elif market == "BTTS":
-            won = hg > 0 and ag > 0
-
-        odd = prediction[
-            "bookmaker_odds"
-        ]
-
-        if odd and odd > 1:
+        if odd > 1:
 
             profit = (
                 odd - 1
                 if won
-                else -1
+                else
+                -1
             )
 
         else:
@@ -3071,7 +4051,8 @@ def settle_finished_predictions():
             profit = (
                 1
                 if won
-                else -1
+                else
+                -1
             )
 
         result = (
@@ -3081,27 +4062,26 @@ def settle_finished_predictions():
             "LOSS"
         )
 
-        connection = db()
+        connection = database()
 
         cursor = connection.cursor()
 
         cursor.execute("""
-
             UPDATE predictions
-
             SET
-
                 status = 'SETTLED',
-
                 actual_result = ?,
-
+                actual_home_goals = ?,
+                actual_away_goals = ?,
                 profit = ?
-
             WHERE fixture_id = ?
-
         """, (
 
             result,
+
+            hg,
+
+            ag,
 
             profit,
 
@@ -3110,16 +4090,17 @@ def settle_finished_predictions():
         ))
 
         connection.commit()
+
         connection.close()
 
         telegram(f"""
-<b>🏁 RÉSULTAT</b>
+<b>🏁 RÉSULTAT — AGENT PRO V4</b>
 
 ⚽ {prediction["home"]}
-{hg} - {ag}
+<b>{hg} - {ag}</b>
 {prediction["away"]}
 
-🎯 {prediction["market"]}
+🎯 {prediction["market_name"]}
 
 Résultat :
 <b>{result}</b>
@@ -3127,98 +4108,92 @@ Résultat :
 Profit unité :
 {profit:+.2f}
 
-🕯️ Score initial :
+Probabilité annoncée :
+{prediction["probability"]:.1f}%
+
+Score :
 {prediction["score"]:.0f}/100
 """)
 
 
 # ============================================================
-# BACKTEST ENGINE
+# PERFORMANCE
 # ============================================================
 
 def performance_report():
 
-    connection = db()
+    connection = database()
 
     cursor = connection.cursor()
 
     cursor.execute("""
-
         SELECT
-
-            COUNT(*) AS total,
-
+            COUNT(*) total,
             SUM(
                 CASE
-                    WHEN status = 'SETTLED'
+                    WHEN status='SETTLED'
                     THEN 1
                     ELSE 0
                 END
-            ) AS settled,
-
+            ) settled,
             SUM(
                 CASE
-                    WHEN actual_result = 'WIN'
+                    WHEN actual_result='WIN'
                     THEN 1
                     ELSE 0
                 END
-            ) AS wins,
-
-            SUM(profit) AS profit
-
+            ) wins,
+            COALESCE(
+                SUM(profit),
+                0
+            ) profit
         FROM predictions
-
     """)
 
-    row = cursor.fetchone()
+    overall = cursor.fetchone()
 
     cursor.execute("""
-
         SELECT
-
             market,
-
-            COUNT(*) AS total,
-
+            COUNT(*) total,
             SUM(
                 CASE
-                    WHEN actual_result = 'WIN'
+                    WHEN actual_result='WIN'
                     THEN 1
                     ELSE 0
                 END
-            ) AS wins,
-
-            SUM(profit) AS profit
-
+            ) wins,
+            COALESCE(
+                SUM(profit),
+                0
+            ) profit
         FROM predictions
-
-        WHERE status = 'SETTLED'
-
+        WHERE status='SETTLED'
         GROUP BY market
-
         ORDER BY profit DESC
-
     """)
 
     markets = cursor.fetchall()
 
     connection.close()
 
-    total = row["total"] or 0
-    settled = row["settled"] or 0
-    wins = row["wins"] or 0
-    profit = row["profit"] or 0
+    total = overall["total"] or 0
+    settled = overall["settled"] or 0
+    wins = overall["wins"] or 0
+    profit = overall["profit"] or 0
 
-    if settled:
-
-        hit_rate = wins / settled * 100
-
-    else:
-
-        hit_rate = 0
+    winrate = (
+        wins
+        /
+        settled
+        *
+        100
+        if settled
+        else 0
+    )
 
     message = f"""
-<b>📊 AGENT PRO — PERFORMANCE</b>
+<b>📊 AGENT PRO V4 — PERFORMANCE</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -3231,40 +4206,56 @@ Settled :
 Wins :
 <b>{wins}</b>
 
-Taux de réussite :
-<b>{hit_rate:.1f}%</b>
+Winrate :
+<b>{winrate:.1f}%</b>
 
 Profit unité :
 <b>{profit:+.2f}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-<b>📈 PAR MARCHÉ</b>
+<b>📈 MARCHÉS</b>
 """
 
     for market in markets:
 
-        market_total = market["total"] or 0
-        market_wins = market["wins"] or 0
-        market_profit = market["profit"] or 0
+        total_market = (
+            market["total"]
+            or 0
+        )
+
+        wins_market = (
+            market["wins"]
+            or 0
+        )
+
+        profit_market = (
+            market["profit"]
+            or 0
+        )
 
         rate = (
-            market_wins
+
+            wins_market
             /
-            market_total
+            total_market
             *
             100
-            if market_total
+
+            if total_market
             else 0
+
         )
 
         message += f"""
 
-{market_name(market["market"])}
+<b>{market_name(
+    market["market"]
+)}</b>
 
-Matchs : {market_total}
+Matchs : {total_market}
 Winrate : {rate:.1f}%
-Profit : {market_profit:+.2f}
+Profit : {profit_market:+.2f}
 """
 
     telegram(
@@ -3273,126 +4264,225 @@ Profit : {market_profit:+.2f}
 
 
 # ============================================================
-# CALIBRATION ENGINE
+# CALIBRATION REPORT
 # ============================================================
 
 def calibration_report():
 
-    connection = db()
+    buckets = (
+        get_calibration_stats()
+    )
+
+    message = """
+<b>🧪 CALIBRATION V4</b>
+
+Le modèle compare :
+
+PROBABILITÉ ANNONCÉE
+VS
+RÉSULTAT RÉEL
+
+━━━━━━━━━━━━━━━━━━
+"""
+
+    ordered = [
+        "40-49",
+        "50-59",
+        "60-69",
+        "70-79",
+        "80-89",
+        "90-99"
+    ]
+
+    for bucket in ordered:
+
+        data = buckets.get(
+            bucket
+        )
+
+        if not data:
+
+            continue
+
+        total = data[
+            "total"
+        ]
+
+        wins = data[
+            "wins"
+        ]
+
+        observed = (
+            wins
+            /
+            total
+            *
+            100
+        )
+
+        expected = mean(
+            data[
+                "expected"
+            ]
+        )
+
+        error = (
+            observed
+            -
+            expected
+        )
+
+        message += f"""
+
+<b>{bucket}%</b>
+
+Échantillon :
+{total}
+
+Réussite réelle :
+{observed:.1f}%
+
+Moyenne annoncée :
+{expected:.1f}%
+
+Erreur :
+{error:+.1f} pts
+"""
+
+    telegram(
+        message
+    )
+
+
+# ============================================================
+# MODEL HEALTH
+# ============================================================
+
+def model_health():
+
+    connection = database()
 
     cursor = connection.cursor()
 
     cursor.execute("""
-
         SELECT
-
             probability,
-
-            actual_result
-
+            actual_result,
+            score,
+            risk,
+            value
         FROM predictions
-
-        WHERE status = 'SETTLED'
-
+        WHERE status='SETTLED'
+        ORDER BY id DESC
+        LIMIT 100
     """)
 
     rows = cursor.fetchall()
 
     connection.close()
 
-    buckets = defaultdict(
-        lambda: {
-            "total": 0,
-            "wins": 0
+    if len(rows) < 10:
+
+        return {
+
+            "sample":
+                len(rows),
+
+            "health":
+                "INSUFFICIENT DATA",
+
+            "winrate":
+                0,
+
+            "avg_score":
+                0
+
         }
+
+    wins = sum(
+
+        1
+        for row in rows
+        if row["actual_result"]
+        == "WIN"
+
     )
 
-    for row in rows:
+    winrate = (
+        wins
+        /
+        len(rows)
+        *
+        100
+    )
 
-        probability = row[
-            "probability"
+    avg_score = mean(
+        [
+            row["score"]
+            for row in rows
         ]
-
-        if probability < 50:
-            bucket = "50-59"
-
-        elif probability < 60:
-            bucket = "60-69"
-
-        elif probability < 70:
-            bucket = "70-79"
-
-        elif probability < 80:
-            bucket = "80-89"
-
-        else:
-            bucket = "90-99"
-
-        buckets[
-            bucket
-        ]["total"] += 1
-
-        if row[
-            "actual_result"
-        ] == "WIN":
-
-            buckets[
-                bucket
-            ]["wins"] += 1
-
-    message = """
-<b>🧪 CALIBRATION DU MODÈLE</b>
-
-Le bot compare ce qu'il annonçait
-avec ce qui s'est réellement produit.
-
-"""
-
-    for bucket in [
-        "50-59",
-        "60-69",
-        "70-79",
-        "80-89",
-        "90-99"
-    ]:
-
-        total = buckets[
-            bucket
-        ]["total"]
-
-        wins = buckets[
-            bucket
-        ]["wins"]
-
-        if total:
-
-            real_rate = (
-                wins
-                /
-                total
-                *
-                100
-            )
-
-            message += (
-                f"\n<b>{bucket}% annoncés</b>"
-                f"\nMatchs : {total}"
-                f"\nRéussite réelle : "
-                f"{real_rate:.1f}%\n"
-            )
-
-    telegram(
-        message
     )
 
+    return {
+
+        "sample":
+            len(rows),
+
+        "health":
+            (
+                "GOOD"
+                if winrate >= 55
+                else
+                "WATCH"
+            ),
+
+        "winrate":
+            winrate,
+
+        "avg_score":
+            avg_score
+
+    }
+
 
 # ============================================================
-# COMMANDES TELEGRAM
+# MODEL HEALTH TELEGRAM
 # ============================================================
 
-def get_updates(offset=None):
+def health_report():
+
+    health = model_health()
+
+    telegram(f"""
+<b>🩺 SANTÉ DU MODÈLE V4</b>
+
+Échantillon :
+<b>{health["sample"]}</b>
+
+Winrate récent :
+<b>{health["winrate"]:.1f}%</b>
+
+Score moyen :
+<b>{health["avg_score"]:.1f}/100</b>
+
+État :
+<b>{health["health"]}</b>
+
+Version :
+<b>{MODEL_VERSION}</b>
+""")
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+def get_updates(
+    offset=None
+):
 
     if not TG_TOKEN:
+
         return []
 
     try:
@@ -3401,13 +4491,18 @@ def get_updates(offset=None):
             "timeout": 5
         }
 
-        if offset:
-            params["offset"] = offset
+        if offset is not None:
+
+            params[
+                "offset"
+            ] = offset
 
         response = requests.get(
 
-            f"https://api.telegram.org/"
-            f"bot{TG_TOKEN}/getUpdates",
+            (
+                "https://api.telegram.org/"
+                f"bot{TG_TOKEN}/getUpdates"
+            ),
 
             params=params,
 
@@ -3420,7 +4515,7 @@ def get_updates(offset=None):
             []
         )
 
-    except:
+    except Exception:
 
         return []
 
@@ -3438,8 +4533,11 @@ def command_loop():
         for update in updates:
 
             offset = (
-                update["update_id"]
-                + 1
+                update[
+                    "update_id"
+                ]
+                +
+                1
             )
 
             message = update.get(
@@ -3449,16 +4547,27 @@ def command_loop():
 
             text = (
                 message
-                .get("text", "")
+                .get(
+                    "text",
+                    ""
+                )
                 .strip()
                 .lower()
             )
 
             if text == "/analyse":
 
-                run_pre_match()
+                telegram(
+                    "🧠 Analyse V4 lancée..."
+                )
+
+                run_prematch()
 
             elif text == "/live":
+
+                telegram(
+                    "📡 Scan LIVE lancé..."
+                )
 
                 run_live()
 
@@ -3470,47 +4579,62 @@ def command_loop():
 
                 calibration_report()
 
+            elif text == "/health":
+
+                health_report()
+
             elif text == "/status":
 
+                health = (
+                    model_health()
+                )
+
                 telegram(f"""
-<b>🟢 AGENT PRO ACTIF</b>
+<b>🟢 AGENT PRO V4 ACTIF</b>
 
-⏰ {now().strftime("%H:%M:%S")}
-
-📡 API : OK
 🧮 Poisson : OK
+📊 Calibration : OK
 💰 Value : OK
 ⚠️ Risk : OK
 🔴 Live : OK
 💾 Database : OK
 
-Matchs live suivis :
-{len(LIVE_STATE)}
+Matchs LIVE :
+<b>{len(LIVE_STATE)}</b>
+
+Historique :
+<b>{health["sample"]}</b>
+
+Winrate récent :
+<b>{health["winrate"]:.1f}%</b>
 """)
 
             elif text == "/start":
 
                 telegram("""
-<b>🕯️ AGENT PRO V3</b>
+<b>🕯️ AGENT PRO FOOTBALL V4</b>
 
 <b>LA BOUGIE DU PARIEUR</b>
 
 Commandes :
 
 /analyse
-→ analyse pré-match
+→ Analyse pré-match
 
 /live
-→ analyse live
+→ Scan live
 
 /stats
-→ performance
+→ Performance
 
 /calibration
-→ calibration du modèle
+→ Calibration
+
+/health
+→ Santé du modèle
 
 /status
-→ état du bot
+→ État du système
 """)
 
         time.sleep(1)
@@ -3526,23 +4650,27 @@ def scheduler():
     last_live = 0
     last_settlement = 0
     last_report = 0
+    last_health = 0
 
     while True:
 
         current = time.time()
 
         # ----------------------------------------------------
-        # PRE-MATCH
+        # PREMATCH
         # ----------------------------------------------------
 
         if (
-            current - last_analysis
-            >= ANALYSIS_INTERVAL
+            current
+            -
+            last_analysis
+            >=
+            ANALYSIS_INTERVAL
         ):
 
             try:
 
-                run_pre_match()
+                run_prematch()
 
             except Exception:
 
@@ -3557,8 +4685,11 @@ def scheduler():
         # ----------------------------------------------------
 
         if (
-            current - last_live
-            >= LIVE_INTERVAL
+            current
+            -
+            last_live
+            >=
+            LIVE_INTERVAL
         ):
 
             try:
@@ -3578,13 +4709,16 @@ def scheduler():
         # ----------------------------------------------------
 
         if (
-            current - last_settlement
-            >= 300
+            current
+            -
+            last_settlement
+            >=
+            300
         ):
 
             try:
 
-                settle_finished_predictions()
+                settle_predictions()
 
             except Exception:
 
@@ -3595,12 +4729,15 @@ def scheduler():
             last_settlement = current
 
         # ----------------------------------------------------
-        # PERFORMANCE REPORT
+        # DAILY REPORT
         # ----------------------------------------------------
 
         if (
-            current - last_report
-            >= 86400
+            current
+            -
+            last_report
+            >=
+            86400
         ):
 
             try:
@@ -3611,12 +4748,112 @@ def scheduler():
             except Exception:
 
                 logging.exception(
-                    "REPORT ERROR"
+                    "DAILY REPORT ERROR"
                 )
 
             last_report = current
 
+        # ----------------------------------------------------
+        # HEALTH
+        # ----------------------------------------------------
+
+        if (
+            current
+            -
+            last_health
+            >=
+            21600
+        ):
+
+            try:
+
+                health_report()
+
+            except Exception:
+
+                logging.exception(
+                    "HEALTH ERROR"
+                )
+
+            last_health = current
+
         time.sleep(2)
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def startup_message():
+
+    return f"""
+<b>🕯️ AGENT PRO FOOTBALL V4</b>
+
+<b>LA BOUGIE DU PARIEUR</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🟢 DATA ENGINE
+🟢 FORM ENGINE
+🟢 HOME/AWAY ENGINE
+🟢 H2H ENGINE
+🟢 POISSON ENGINE
+🟢 MARKET ENGINE
+🟢 VALUE ENGINE
+🟢 RISK ENGINE
+🟢 CONVERGENCE ENGINE
+🟢 CALIBRATION ENGINE
+🟢 DECISION ENGINE
+🟢 LIVE ENGINE
+🟢 RESULT ENGINE
+🟢 PERFORMANCE ENGINE
+🟢 MODEL HEALTH
+
+━━━━━━━━━━━━━━━━━━
+
+<b>V4 =</b>
+
+Données
+↓
+Probabilité
+↓
+Calibration
+↓
+Value
+↓
+Risque
+↓
+Décision
+↓
+Live
+↓
+Résultat
+↓
+Apprentissage
+
+━━━━━━━━━━━━━━━━━━
+
+⏱️ Pré-match :
+{ANALYSIS_INTERVAL}s
+
+🔴 Live :
+{LIVE_INTERVAL}s
+
+🎯 Score minimum :
+{MIN_SCORE}/100
+
+💰 Value minimum :
+{MIN_VALUE} pts
+
+🤖 Version :
+{MODEL_VERSION}
+
+<i>
+Le système peut dire PASS.
+C'est une fonctionnalité,
+pas un échec.
+</i>
+"""
 
 
 # ============================================================
@@ -3640,77 +4877,45 @@ def main():
     if not TG_CHAT:
 
         raise RuntimeError(
-            "TELEGRAM_CHAT_ID manquante"
+            "TELEGRAM_CHAT_ID manquant"
         )
+
+    # --------------------------------------------------------
+    # Database
+    # --------------------------------------------------------
 
     init_database()
 
-    telegram(f"""
-<b>🕯️ AGENT PRO FOOTBALL V3</b>
+    # --------------------------------------------------------
+    # Startup
+    # --------------------------------------------------------
 
-<b>LA BOUGIE DU PARIEUR</b>
-
-━━━━━━━━━━━━━━━━━━
-
-🟢 DATA ENGINE
-🟢 FORM ENGINE
-🟢 HOME/AWAY ENGINE
-🟢 H2H ENGINE
-🟢 STRENGTH ENGINE
-🟢 POISSON ENGINE
-🟢 MARKET ENGINE
-🟢 VALUE ENGINE
-🟢 RISK ENGINE
-🟢 CONVERGENCE ENGINE
-🟢 LIVE ENGINE
-🟢 BACKTEST ENGINE
-🟢 CALIBRATION ENGINE
-🟢 DATABASE
-
-━━━━━━━━━━━━━━━━━━
-
-📡 Pré-match :
-toutes les {ANALYSIS_INTERVAL}s
-
-🔴 Live :
-toutes les {LIVE_INTERVAL}s
-
-🎯 Score minimum :
-{MIN_SCORE}/100
-
-━━━━━━━━━━━━━━━━━━
-
-<i>
-Données
-→ Probabilité
-→ Value
-→ Risque
-→ Décision
-→ Résultat
-→ Calibration
-</i>
-""")
+    telegram(
+        startup_message()
+    )
 
     # --------------------------------------------------------
     # Telegram commands
     # --------------------------------------------------------
 
-    command_thread = threading.Thread(
-        target=command_loop,
-        daemon=True
+    command_thread = (
+        threading.Thread(
+            target=command_loop,
+            daemon=True
+        )
     )
 
     command_thread.start()
 
     # --------------------------------------------------------
-    # Scheduler
+    # Scheduler principal
     # --------------------------------------------------------
 
     scheduler()
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
