@@ -1,55 +1,91 @@
-import os, math, requests
-from datetime import datetime
+import os
+import requests
+from datetime import datetime, timedelta
+from collections import Counter
 
+API_KEY = os.getenv("API_FOOTBALL_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY = os.getenv("API_FOOTBALL_KEY")
 
 HEADERS = {"x-apisports-key": API_KEY}
-BASE_URL = "https://v3.football.api-sports.io"
 
-def poisson(k, lam):
-    if lam <= 0: lam = 0.1
-    return (math.exp(-lam) * (lam**k)) / math.factorial(k)
+def get_finished_matches(date_str):
+    url = f"https://v3.football.api-sports.io/fixtures?date={date_str}"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    data = r.json().get("response", [])
+    finished = [m for m in data if m["fixture"]["status"]["short"] == "FT"]
+    return finished
 
-def get_last_5_stats(team_id):
-    try:
-        url = f"{BASE_URL}/fixtures?team={team_id}&last=5"
-        r = requests.get(url, headers=HEADERS, timeout=10).json()
-        fixtures = r.get('response', [])
-        if not fixtures: return 1.2, 1.2
-        bp, bc = 0, 0
-        for f in fixtures:
-            is_home = f['teams']['home']['id'] == team_id
-            gh = f['goals']['home'] or 0
-            ga = f['goals']['away'] or 0
-            if is_home: bp+=gh; bc+=ga
-            else: bp+=ga; bc+=gh
-        return bp/5, bc/5
-    except: return 1.2, 1.2
+def analyze(matches):
+    if not matches:
+        return None
+    total = len(matches)
+    home_win = sum(1 for m in matches if m["goals"]["home"] > m["goals"]["away"])
+    away_win = sum(1 for m in matches if m["goals"]["away"] > m["goals"]["home"])
+    draw = total - home_win - away_win
+    over15 = sum(1 for m in matches if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 1.5)
+    over25 = sum(1 for m in matches if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 2.5)
+    btts = sum(1 for m in matches if m["goals"]["home"]>0 and m["goals"]["away"]>0)
 
-def analyser():
-    today = datetime.now().strftime('%Y-%m-%d')
-    url = f"{BASE_URL}/fixtures?date={today}"
-    data = requests.get(url, headers=HEADERS, timeout=10).json().get('response', [])[:8]
-    msg = f"⚽ *ANALYSE CHRONO {today}*\n\n"
-    trouve=0
-    for m in data:
-        hid = m['teams']['home']['id']; aid = m['teams']['away']['id']
-        hname = m['teams']['home']['name']; aname = m['teams']['away']['name']
-        hp, hc = get_last_5_stats(hid)
-        ap, ac = get_last_5_stats(aid)
-        xg_h = (hp + ac)/2; xg_a = (ap + hc)/2
-        prob_h=0
-        for i in range(6):
-            for j in range(6):
-                if i>j: prob_h += poisson(i,xg_h)*poisson(j,xg_a)
-        if prob_h>0.55:
-            trouve+=1
-            msg+=f"🎯 *{hname} vs {aname}*\nForme: {round(hp,1)} vs {round(ap,1)} buts\nxG: {round(xg_h,2)}-{round(xg_a,2)} | P(Home): {round(prob_h*100,1)}%\n\n"
-    if trouve>0:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"Markdown"})
-        print("Envoyé")
-    else: print("Pas de value")
+    return {
+        "total": total,
+        "home": home_win/total*100,
+        "away": away_win/total*100,
+        "draw": draw/total*100,
+        "over15": over15/total*100,
+        "over25": over25/total*100,
+        "btts": btts/total*100,
+    }
 
-if __name__ == "__main__": analyser()
+def format_table(a, b, label_a, label_b):
+    lines = [
+        f"📊 *AGENT SCIENTIFIQUE SPORTS* 📊",
+        f"Analyse {label_a} vs {label_b} | {datetime.now().strftime('%d/%m %H:%M')}",
+        "",
+        f"`{'Loi':<10} {label_a:<8} {label_b:<8} Tendance`",
+        f"`{'-'*40}`",
+    ]
+    laws = [("Domicile","home"),("Extérieur","away"),("Nul","draw"),("Over1.5","over15"),("Over2.5","over25"),("BTTS","btts")]
+    best_law = ""
+    best_gain = -100
+    for name, key in laws:
+        va = a[key] if a else 0
+        vb = b[key] if b else 0
+        diff = vb - va
+        emoji = "🔥" if diff>10 else "📈" if diff>0 else "📉"
+        if diff > best_gain:
+            best_gain = diff
+            best_law = name
+        lines.append(f"`{name:<10} {va:5.1f}% {vb:5.1f}% {emoji} {diff:+.1f}%`")
+
+    lines += ["", f"🏆 *Loi la plus en hausse: {best_law} ({best_gain:+.1f}%) aujourd'hui*"]
+
+    if b and b['total']>0:
+        if b['home']>65: lines.append(f"⚠️ TENDANCE: {b['home']:.0f}% victoires DOMICILE aujourd'hui!")
+        if b['over25']>70: lines.append(f"⚠️ TENDANCE: Journée à BUTS {b['over25']:.0f}% Over2.5!")
+        if b['btts']>65: lines.append(f"⚠️ TENDANCE: BTTS énorme {b['btts']:.0f}%!")
+
+    lines.append(f"\n_Matchs analysés: {a['total'] if a else 0} hier / {b['total'] if b else 0} auj._")
+    return "\n".join(lines)
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload, timeout=15)
+
+if __name__ == "__main__":
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+
+    print(f"Analyse {yesterday} et {today}")
+    matches_y = get_finished_matches(str(yesterday))
+    matches_t = get_finished_matches(str(today))
+
+    if not matches_y and not matches_t:
+        send_telegram(f"🤖 Agent en ligne - Pas encore de matchs finis aujourd'hui ({today}). {len(matches_y)} hier.")
+    else:
+        stats_y = analyze(matches_y)
+        stats_t = analyze(matches_t)
+        msg = format_table(stats_y, stats_t, "HIER", "AUJ")
+        print(msg)
+        send_telegram(msg)
