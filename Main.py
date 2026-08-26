@@ -1,111 +1,101 @@
-import os, requests
-from datetime import datetime, timedelta
+import os, requests, time
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 API_KEY = os.getenv("API_FOOTBALL_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 CAMEROON = ZoneInfo("Africa/Douala")
 HEADERS = {"x-apisports-key": API_KEY}
 
-def fetch_fixtures(date_str):
-    url = f"https://v3.football.api-sports.io/fixtures?date={date_str}&timezone=Africa/Douala"
-    return requests.get(url, headers=HEADERS, timeout=30).json().get("response", [])
+def api(url):
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    return r.json().get("response", [])
 
-def fetch_odds(date_str):
-    # On récupère les cotes pour savoir qui est favori
-    url = f"https://v3.football.api-sports.io/odds?date={date_str}&timezone=Africa/Douala"
-    r = requests.get(url, headers=HEADERS, timeout=30).json().get("response", [])
-    odds_map = {}
-    for o in r:
-        fid = o["fixture"]["id"]
-        # On prend la cote 1X2 moyenne
-        try:
-            values = o["bookmakers"][0]["bets"][0]["values"] # 1X2
-            # values = [{"value":"Home","odd":"1.50"},...]
-            home_odd = float([v for v in values if v["value"]=="Home"][0]["odd"])
-            away_odd = float([v for v in values if v["value"]=="Away"][0]["odd"])
-            odds_map[fid] = {"home": home_odd, "away": away_odd}
-        except: pass
-    return odds_map
-
-def analyze_favorite_trap(fixtures, odds_map):
-    """Détecte les favoris qui se font surprendre"""
-    pieges = 0
-    total_fav = 0
-    signes = {"away_fav_lose": 0, "small_odd_lose": 0, "btts_upset": 0}
-
+def get_form(team_id):
+    url = f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=10&timezone=Africa/Douala"
+    fixtures = api(url)
+    w=d=l=0
+    goals_for=0
     for m in fixtures:
-        if m["fixture"]["status"]["short"]!= "FT": continue
-        fid = m["fixture"]["id"]
-        if fid not in odds_map: continue
+        if m["fixture"]["status"]["short"]!="FT": continue
+        is_home = m["teams"]["home"]["id"]==team_id
+        hg, ag = m["goals"]["home"], m["goals"]["away"]
+        goals_for += hg if is_home else ag
+        if (is_home and hg>ag) or (not is_home and ag>hg): w+=1
+        elif hg==ag: d+=1
+        else: l+=1
+    return {"W":w,"D":d,"L":l, "form_str": f"{w}V-{d}N-{l}D", "avg_goals": round(goals_for/max(1,len(fixtures)),1)}
 
-        home_goals = m["goals"]["home"]
-        away_goals = m["goals"]["away"]
-        home_odd = odds_map[fid]["home"]
-        away_odd = odds_map[fid]["away"]
+def get_h2h(id1, id2):
+    url = f"https://v3.football.api-sports.io/fixtures/headtohead?h2h={id1}-{id2}&last=10&timezone=Africa/Douala"
+    fixtures = api(url)
+    w1=w2=d=0
+    for m in fixtures:
+        if m["fixture"]["status"]["short"]!="FT": continue
+        if m["goals"]["home"]>m["goals"]["away"]:
+            if m["teams"]["home"]["id"]==id1: w1+=1
+            else: w2+=1
+        elif m["goals"]["home"]<m["goals"]["away"]:
+            if m["teams"]["away"]["id"]==id1: w1+=1
+            else: w2+=1
+        else: d+=1
+    return {"w1":w1,"w2":w2,"d":d, "total":len(fixtures)}
 
-        # Qui est favori? cote < 1.90
-        fav = None
-        if home_odd < 1.9 and home_odd < away_odd: fav = "home"
-        if away_odd < 1.9 and away_odd < home_odd: fav = "away"
-        if not fav: continue
-
-        total_fav += 1
-        # Favori battu?
-        upset = (fav=="home" and home_goals < away_goals) or (fav=="away" and away_goals < home_goals)
-        if upset:
-            pieges += 1
-            if fav=="away": signes["away_fav_lose"] += 1
-            if min(home_odd, away_odd) < 1.60: signes["small_odd_lose"] += 1
-            if home_goals>0 and away_goals>0: signes["btts_upset"] += 1
-
-    if total_fav == 0: return None
-    taux = round(pieges/total_fav*100, 1)
-    return {"taux": taux, "pieges": pieges, "total": total_fav, "signes": signes}
-
-# --- EXECUTION TEMPS REEL ---
+# --- COEUR PRO ---
 now = datetime.now(CAMEROON)
 today_str = now.date().isoformat()
-yesterday_str = (now.date() - timedelta(days=1)).isoformat()
+fixtures_today = api(f"https://v3.football.api-sports.io/fixtures?date={today_str}&timezone=Africa/Douala")
+upcoming = [m for m in fixtures_today if m["fixture"]["status"]["short"]=="NS"]
+upcoming = sorted(upcoming, key=lambda x: x["fixture"]["timestamp"])[:6] # On analyse les 6 prochains pour ne pas cramer l'API
 
-fix_y = fetch_fixtures(yesterday_str)
-odds_y = fetch_odds(yesterday_str)
+msg = f"🎙️ *AGENT PRO FOOTBALL - {now.strftime('%H:%M')} Bafoussam*\n"
+msg += f"Bonsoir Joël, voici mon briefing tactique du jour.\n\n"
+msg += f"J'ai isolé {len(upcoming)} matchs à fort enjeu. Analyse Forme + H2H :\n\n"
 
-trap_stats = analyze_favorite_trap(fix_y, odds_y)
+alerts = 0
+for m in upcoming:
+    home = m["teams"]["home"]
+    away = m["teams"]["away"]
+    hid, aid = home["id"], away["id"]
+    
+    time.sleep(0.6) # pour respecter l'API
+    form_home = get_form(hid)
+    time.sleep(0.6)
+    form_away = get_form(aid)
+    time.sleep(0.6)
+    h2h = get_h2h(hid, aid)
 
-# Analyse classique (comme avant)
-def quick_stats(fix):
-    ft=[m for m in fix if m["fixture"]["status"]["short"]=="FT"]
-    if not ft: return None
-    t=len(ft)
-    return {"t": t}
+    heure = datetime.fromtimestamp(m["fixture"]["timestamp"], tz=CAMEROON).strftime('%H:%M')
+    
+    # --- LOI MATHEMATIQUE ALERTEUR (sans cote) ---
+    # Un favori est une équipe avec >=6 victoires sur 10 derniers
+    fav = None
+    if form_home["W"] >= 6 and form_home["W"] > form_away["W"]+2: fav = "home"
+    if form_away["W"] >= 6 and form_away["W"] > form_home["W"]+2: fav = "away"
 
-# Message
-msg = f"📍 *V4 ALERTEUR FAVORI - {now.strftime('%H:%M')} BAF*\n\n"
-msg += f"*HIER {yesterday_str}* analysé\n"
+    is_trap = False
+    raison = ""
+    if fav=="home" and h2h["w1"] < h2h["w2"]:
+        is_trap = True
+        raison = f"Malgré sa forme ({form_home['form_str']}), {home['name']} est mené {h2h['w2']} à {h2h['w1']} sur les 10 derniers H2H."
+    if fav=="away" and form_away["W"]>=6 and form_home["W"]>=3:
+        is_trap = True
+        raison = f"{away['name']} est favori ({form_away['form_str']}) mais {home['name']} est solide à domicile ({form_home['form_str']}). Piège classique extérieur."
 
-if trap_stats:
-    msg += f"🎯 *LOI ALERTEUR MATHEMATIQUE*\n"
-    msg += f"Favoris piégés: {trap_stats['pieges']}/{trap_stats['total']} = *{trap_stats['taux']}%*\n"
+    msg += f"⏰ *{heure} - {home['name']} vs {away['name']}*\n"
+    msg += f"   Forme: {home['name']} {form_home['form_str']} | {away['name']} {form_away['form_str']}\n"
+    msg += f"   H2H (10): {home['name']} {h2h['w1']} - {h2h['d']}N - {h2h['w2']} {away['name']}\n"
 
-    if trap_stats["taux"] >= 35:
-        msg += f"🚨 *ALERTE ROUGE - JOURNÉE À PIÈGES*\n"
-        msg += f"Signes observés:\n"
-        msg += f"- Favoris extérieur qui tombent: {trap_stats['signes']['away_fav_lose']}\n"
-        msg += f"- Petites cotes <1.60 qui tombent: {trap_stats['signes']['small_odd_lose']}\n"
-        msg += f"- Pièges avec BTTS: {trap_stats['signes']['btts_upset']}\n\n"
-        msg += f"💡 *CONSEIL MATH*: Ne joue PAS les favoris <1.80 aujourd'hui. Joue Double Chance Outsiders ou BTTS.\n"
-    elif trap_stats["taux"] >= 20:
-        msg += f"⚠️ Tendance piège modérée. Prudence sur les favoris à l'extérieur.\n"
+    if is_trap:
+        alerts+=1
+        msg += f"   🚨 *ALERTE LOI TRAPPE:* {raison}\n"
+        msg += f"   👉 *Loi conseillée: Double Chance {home['name'] if fav=='away' else away['name']} ou BTTS OUI*\n\n"
     else:
-        msg += f"✅ Journée normale, favoris respectés. Tu peux jouer favoris Domicile.\n"
-else:
-    msg += f"Pas assez de cotes hier pour calculer les pièges.\n"
+        msg += f"   ✅ Tendance logique respectée. Loi: Victoire {home['name'] if form_home['W']>=form_away['W'] else away['name']} ou Over 1.5\n\n"
 
-msg += f"\n⏳ {len([m for m in fetch_fixtures(today_str) if m['fixture']['status']['short']=='NS'])} matchs à venir aujourd'hui."
+msg += f"---\n📊 *Synthèse:* {alerts} piège(s) détecté(s) sur {len(upcoming)} matchs. Reste prudent sur les gros favoris à l'extérieur."
 
-requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-              data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-
-print("V4 envoyé")
+# Envoi
+requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"})
+print("Message PRO envoyé")
