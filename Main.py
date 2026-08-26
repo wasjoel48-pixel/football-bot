@@ -1,95 +1,111 @@
-import os
-import requests
+import os, requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# --- CONFIG ---
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 CAMEROON = ZoneInfo("Africa/Douala")
 HEADERS = {"x-apisports-key": API_KEY}
-BASE_URL = "https://v3.football.api-sports.io/fixtures"
 
-def fetch(date_str):
-    """Récupère tous les matchs d'une date en heure de Bafoussam"""
-    url = f"{BASE_URL}?date={date_str}&timezone=Africa/Douala"
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    return r.json().get("response", [])
+def fetch_fixtures(date_str):
+    url = f"https://v3.football.api-sports.io/fixtures?date={date_str}&timezone=Africa/Douala"
+    return requests.get(url, headers=HEADERS, timeout=30).json().get("response", [])
 
-def analyze(fixtures):
-    ft = [m for m in fixtures if m["fixture"]["status"]["short"] == "FT"]
-    if not ft: return None
-    total = len(ft)
-    def pct(n): return round(n/total*100, 1)
-    hw = sum(1 for m in ft if m["goals"]["home"] > m["goals"]["away"])
-    aw = sum(1 for m in ft if m["goals"]["away"] > m["goals"]["home"])
-    dr = total - hw - aw
-    o15 = sum(1 for m in ft if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 1.5)
-    o25 = sum(1 for m in ft if (m["goals"]["home"] or 0)+(m["goals"]["away"] or 0) > 2.5)
-    btts = sum(1 for m in ft if m["goals"]["home"]>0 and m["goals"]["away"]>0)
-    return {"total": total, "home": pct(hw), "away": pct(aw), "draw": pct(dr), "over15": pct(o15), "over25": pct(o25), "btts": pct(btts)}
+def fetch_odds(date_str):
+    # On récupère les cotes pour savoir qui est favori
+    url = f"https://v3.football.api-sports.io/odds?date={date_str}&timezone=Africa/Douala"
+    r = requests.get(url, headers=HEADERS, timeout=30).json().get("response", [])
+    odds_map = {}
+    for o in r:
+        fid = o["fixture"]["id"]
+        # On prend la cote 1X2 moyenne
+        try:
+            values = o["bookmakers"][0]["bets"][0]["values"] # 1X2
+            # values = [{"value":"Home","odd":"1.50"},...]
+            home_odd = float([v for v in values if v["value"]=="Home"][0]["odd"])
+            away_odd = float([v for v in values if v["value"]=="Away"][0]["odd"])
+            odds_map[fid] = {"home": home_odd, "away": away_odd}
+        except: pass
+    return odds_map
 
-# --- TEMPS RÉEL BAFOSSAM ---
+def analyze_favorite_trap(fixtures, odds_map):
+    """Détecte les favoris qui se font surprendre"""
+    pieges = 0
+    total_fav = 0
+    signes = {"away_fav_lose": 0, "small_odd_lose": 0, "btts_upset": 0}
+
+    for m in fixtures:
+        if m["fixture"]["status"]["short"]!= "FT": continue
+        fid = m["fixture"]["id"]
+        if fid not in odds_map: continue
+
+        home_goals = m["goals"]["home"]
+        away_goals = m["goals"]["away"]
+        home_odd = odds_map[fid]["home"]
+        away_odd = odds_map[fid]["away"]
+
+        # Qui est favori? cote < 1.90
+        fav = None
+        if home_odd < 1.9 and home_odd < away_odd: fav = "home"
+        if away_odd < 1.9 and away_odd < home_odd: fav = "away"
+        if not fav: continue
+
+        total_fav += 1
+        # Favori battu?
+        upset = (fav=="home" and home_goals < away_goals) or (fav=="away" and away_goals < home_goals)
+        if upset:
+            pieges += 1
+            if fav=="away": signes["away_fav_lose"] += 1
+            if min(home_odd, away_odd) < 1.60: signes["small_odd_lose"] += 1
+            if home_goals>0 and away_goals>0: signes["btts_upset"] += 1
+
+    if total_fav == 0: return None
+    taux = round(pieges/total_fav*100, 1)
+    return {"taux": taux, "pieges": pieges, "total": total_fav, "signes": signes}
+
+# --- EXECUTION TEMPS REEL ---
 now = datetime.now(CAMEROON)
 today_str = now.date().isoformat()
 yesterday_str = (now.date() - timedelta(days=1)).isoformat()
 
-print(f"Analyse lancée à Bafoussam: {now.strftime('%H:%M %d/%m/%Y')}")
+fix_y = fetch_fixtures(yesterday_str)
+odds_y = fetch_odds(yesterday_str)
 
-fixtures_yesterday = fetch(yesterday_str)
-fixtures_today = fetch(today_str)
+trap_stats = analyze_favorite_trap(fix_y, odds_y)
 
-stats_y = analyze(fixtures_yesterday)
-stats_today_ft = analyze(fixtures_today)
+# Analyse classique (comme avant)
+def quick_stats(fix):
+    ft=[m for m in fix if m["fixture"]["status"]["short"]=="FT"]
+    if not ft: return None
+    t=len(ft)
+    return {"t": t}
 
-# Chronologie du temps réel aujourd'hui
-live = [m for m in fixtures_today if m["fixture"]["status"]["short"] in ["1H","2H","HT","ET","P","LIVE"]]
-upcoming = [m for m in fixtures_today if m["fixture"]["status"]["short"] == "NS"]
+# Message
+msg = f"📍 *V4 ALERTEUR FAVORI - {now.strftime('%H:%M')} BAF*\n\n"
+msg += f"*HIER {yesterday_str}* analysé\n"
 
-# Filtrer les matchs à venir APRÈS ton heure actuelle
-upcoming_future = []
-for m in upcoming:
-    # l'heure du match est déjà en Africa/Douala grâce à l'API
-    kickoff_ts = m["fixture"]["timestamp"]
-    kickoff = datetime.fromtimestamp(kickoff_ts, tz=CAMEROON)
-    if kickoff > now:
-        upcoming_future.append(m)
+if trap_stats:
+    msg += f"🎯 *LOI ALERTEUR MATHEMATIQUE*\n"
+    msg += f"Favoris piégés: {trap_stats['pieges']}/{trap_stats['total']} = *{trap_stats['taux']}%*\n"
 
-# Meilleure loi d'hier
-if stats_y:
-    best_loi = max([("Domicile", stats_y["home"]), ("Over 1.5", stats_y["over15"]), ("Over 2.5", stats_y["over25"]), ("BTTS", stats_y["btts"])], key=lambda x: x[1])
+    if trap_stats["taux"] >= 35:
+        msg += f"🚨 *ALERTE ROUGE - JOURNÉE À PIÈGES*\n"
+        msg += f"Signes observés:\n"
+        msg += f"- Favoris extérieur qui tombent: {trap_stats['signes']['away_fav_lose']}\n"
+        msg += f"- Petites cotes <1.60 qui tombent: {trap_stats['signes']['small_odd_lose']}\n"
+        msg += f"- Pièges avec BTTS: {trap_stats['signes']['btts_upset']}\n\n"
+        msg += f"💡 *CONSEIL MATH*: Ne joue PAS les favoris <1.80 aujourd'hui. Joue Double Chance Outsiders ou BTTS.\n"
+    elif trap_stats["taux"] >= 20:
+        msg += f"⚠️ Tendance piège modérée. Prudence sur les favoris à l'extérieur.\n"
+    else:
+        msg += f"✅ Journée normale, favoris respectés. Tu peux jouer favoris Domicile.\n"
 else:
-    best_loi = ("Over 1.5", 0)
+    msg += f"Pas assez de cotes hier pour calculer les pièges.\n"
 
-# --- MESSAGE TELEGRAM ---
-message = f"📍 *AGENT SCIENTIFIQUE V3 - BAFOSSAM*\n"
-message += f"🕐 {now.strftime('%H:%M')} - {now.strftime('%d %B %Y')}\n\n"
+msg += f"\n⏳ {len([m for m in fetch_fixtures(today_str) if m['fixture']['status']['short']=='NS'])} matchs à venir aujourd'hui."
 
-if stats_y:
-    message += f"*HIER ({yesterday_str})* - {stats_y['total']} matchs finis\n"
-    message += f"`Domicile: {stats_y['home']}% | Ext: {stats_y['away']}% | Nul: {stats_y['draw']}%`\n"
-    message += f"`Over1.5: {stats_y['over15']}% | Over2.5: {stats_y['over25']}% | BTTS: {stats_y['btts']}%`\n\n"
-else:
-    message += f"Aucun match fini hier.\n\n"
+requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+              data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
-message += f"*AUJOURD'HUI ({today_str})*\n"
-if stats_today_ft:
-    message += f"✅ Finis: {stats_today_ft['total']} matchs\n"
-message += f"🔴 Live maintenant: {len(live)} matchs\n"
-message += f"⏳ À venir après {now.strftime('%H:%M')}: {len(upcoming_future)} matchs\n\n"
-
-message += f"🏆 *LOI DU JOUR (basée sur hier): {best_loi[0]} à {best_loi[1]}%*\n"
-message += f"👉 À appliquer sur les {len(upcoming_future)} prochains matchs.\n"
-
-if len(upcoming_future) > 0:
-    message += f"\n*PROCHAINS MATCHS:*\n"
-    for m in upcoming_future[:5]: # 5 premiers
-        heure = datetime.fromtimestamp(m["fixture"]["timestamp"], tz=CAMEROON).strftime('%H:%M')
-        message += f"{heure} - {m['teams']['home']['name']} vs {m['teams']['away']['name']}\n"
-
-# Envoi
-url_tg = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-requests.post(url_tg, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
-print("Message envoyé")
+print("V4 envoyé")
