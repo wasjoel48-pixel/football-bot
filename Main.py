@@ -1,120 +1,138 @@
-import os, requests
-from datetime import datetime
+import os, requests, re
+from datetime import datetime, timedelta
 import pytz
 from math import exp, factorial
 from collections import defaultdict
 
-API_KEY = os.getenv("API_FOOTBALL_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Heure Bafoussam
+API_KEY = os.getenv("API_FOOTBALL_KEY")
 TZ = pytz.timezone("Africa/Douala")
-NOW = datetime.now(TZ)
-
 HEADERS = {"x-apisports-key": API_KEY}
 
-def poisson(k, lam):
-    return (lam**k * exp(-lam)) / factorial(k)
+def poisson_prob(lam, seuil):
+    def pois(k): return (lam**k * exp(-lam)) / factorial(k)
+    prob_under = sum(pois(k) for k in range(int(seuil)+1))
+    return round((1 - prob_under)*100, 1)
 
-def prob_over(lam, seuil):
-    # seuil 1.5 = P(k>=2), seuil 2.5 = P(k>=3)
-    prob_under = sum(poisson(k, lam) for k in range(int(seuil)+1))
-    return (1 - prob_under) * 100
-
-def get_fixtures():
-    # Matchs du jour
-    date_str = NOW.strftime("%Y-%m-%d")
-    url = f"https://v3.football.api-sports.io/fixtures?date={date_str}"
+def get_team_id(name):
+    url = f"https://v3.football.api-sports.io/teams?search={name}"
     r = requests.get(url, headers=HEADERS).json()
-    return r.get("response", [])
+    if r['response']: return r['response'][0]['team']['id'], r['response'][0]['team']['name']
+    return None, None
 
-def get_last5_goals(team_id):
-    url = f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=5"
-    r = requests.get(url, headers=HEADERS).json()
-    total_goals = []
-    for m in r.get("response", []):
-        g_home = m['goals']['home'] or 0
-        g_away = m['goals']['away'] or 0
-        total_goals.append(g_home + g_away)
-    if not total_goals:
-        return 1.5 # valeur par défaut si pas d'histo
-    return sum(total_goals) / len(total_goals)
+def analyse_equipe(team_id):
+    url = f"https://v3.football.api-sports.io/fixtures?team={team_id}&last=10"
+    data = requests.get(url, headers=HEADERS).json().get('response', [])
+    buts_pour = []
+    buts_contre = []
+    btts = 0
+    over15 = 0
+    over25 = 0
+    vic = nul = defe = 0
 
-def main():
-    fixtures = get_fixtures()
-    analyses = []
+    for m in data:
+        gh = m['goals']['home']; ga = m['goals']['away']
+        if gh is None or ga is None: continue
+        is_home = m['teams']['home']['id'] == team_id
+        bp = gh if is_home else ga
+        bc = ga if is_home else gh
+        buts_pour.append(bp); buts_contre.append(bc)
+        if gh>0 and ga>0: btts+=1
+        if gh+ga > 1: over15+=1
+        if gh+ga > 2: over25+=1
+        # resultat
+        if (is_home and gh>ga) or (not is_home and ga>gh): vic+=1
+        elif gh==ga: nul+=1
+        else: defe+=1
 
-    for f in fixtures[:20]: # on limite à 20 pour économiser l'API
-        fixture_time = datetime.fromisoformat(f['fixture']['date'].replace("Z","+00:00")).astimezone(TZ)
-        if fixture_time < NOW: # déjà joué
-            continue
-        
-        home_id = f['teams']['home']['id']
-        away_id = f['teams']['away']['id']
-        home_name = f['teams']['home']['name']
-        away_name = f['teams']['away']['name']
+    if not buts_pour: return None
+    return {
+        "moy_pour": sum(buts_pour)/len(buts_pour),
+        "moy_contre": sum(buts_contre)/len(buts_contre),
+        "moy_total": sum([a+b for a,b in zip(buts_pour,buts_contre)])/len(buts_pour),
+        "btts_rate": round(btts/len(data)*100,1),
+        "over15_rate": round(over15/len(data)*100,1),
+        "over25_rate": round(over25/len(data)*100,1),
+        "forme": f"{vic}V-{nul}N-{defe}D sur 10",
+        "clean_sheet": round(buts_contre.count(0)/len(data)*100,1)
+    }
 
-        avg_home = get_last5_goals(home_id)
-        avg_away = get_last5_goals(away_id)
-        
-        # Lambda du match = moyenne des deux moyennes
-        lam = (avg_home + avg_away) / 2
+def get_h2h(id1, id2):
+    url = f"https://v3.football.api-sports.io/fixtures/headtohead?h2h={id1}-{id2}&last=5"
+    data = requests.get(url, headers=HEADERS).json().get('response', [])
+    buts = []
+    for m in data:
+        gh = m['goals']['home'] or 0; ga = m['goals']['away'] or 0
+        buts.append(gh+ga)
+    if not buts: return "Pas de H2H", 0
+    return f"{len(data)} matchs, Moy {sum(buts)/len(buts):.2f} buts/match", sum(buts)/len(buts)
 
-        over15 = prob_over(lam, 1.5)
-        over25 = prob_over(lam, 2.5)
+def analyse_match(nom_match, heure):
+    # nom_match = "Arsenal vs Chelsea"
+    if "vs" not in nom_match: return "Format: Equipe A vs Equipe B"
+    a,b = [x.strip() for x in nom_match.split("vs")[:2]]
+    id_a, vrai_a = get_team_id(a)
+    id_b, vrai_b = get_team_id(b)
+    if not id_a or not id_b: return f"❌ Equipe non trouvée: {a} ou {b}"
 
-        analyses.append({
-            "match": f"{home_name} vs {away_name}",
-            "heure": fixture_time.strftime("%H:%M"),
-            "moy_home": round(avg_home,2),
-            "moy_away": round(avg_away,2),
-            "lambda": round(lam,2),
-            "over15": round(over15,1),
-            "over25": round(over25,1),
-            "score_max": max(over15, over25)
-        })
+    stat_a = analyse_equipe(id_a)
+    stat_b = analyse_equipe(id_b)
+    h2h_text, h2h_moy = get_h2h(id_a, id_b)
 
-    # TRI - Top 3 par probabilité la plus haute
-    top3 = sorted(analyses, key=lambda x: x['score_max'], reverse=True)[:3]
+    lam = (stat_a['moy_total'] + stat_b['moy_total'] + h2h_moy) / 3 if h2h_moy else (stat_a['moy_total']+stat_b['moy_total'])/2
 
-    # Message Telegram PRO
-    msg = f"📍 Bafoussam {NOW.strftime('%H:%M')} - Update 2H\n"
-    msg += f"🔬 Loi de Poisson (5 derniers matchs - buts totaux)\n\n"
+    over15_p = poisson_prob(lam, 1.5)
+    over25_p = poisson_prob(lam, 2.5)
+    btts_p = (stat_a['btts_rate'] + stat_b['btts_rate'])/2
 
-    if not top3:
-        msg += "Pas de matchs à venir."
+    # CONCLUSION INTELLIGENTE DU BOT
+    if over15_p >= 80 and stat_a['over15_rate']>=80 and stat_b['over15_rate']>=80:
+        reco = "✅ CONCLUSION BOT: OVER 1.5 ULTRA SAFE"
+    elif over25_p >= 70 and btts_p >= 55:
+        reco = "✅ CONCLUSION BOT: OVER 2.5 + BTTS OUI (match ouvert)"
+    elif stat_a['clean_sheet']>=50 or stat_b['clean_sheet']>=50:
+        reco = "✅ CONCLUSION BOT: BTTS NON probable (une défense solide)"
+    elif btts_p >= 65:
+        reco = "✅ CONCLUSION BOT: BTTS OUI"
     else:
-        for i, m in enumerate(top3, 1):
-            msg += f"{i}️⃣ {m['heure']} - {m['match']}\n"
-            msg += f"   Moy buts: {m['moy_home']} (Dom) | {m['moy_away']} (Ext) -> λ={m['lambda']}\n"
-            msg += f"   📊 Over 1.5: {m['over15']}% | Over 2.5: {m['over25']}%\n"
-            best = "OVER 1.5" if m['over15'] > m['over25'] else "OVER 2.5"
-            msg += f"   ✅ RECO: {best}\n\n"
+        reco = "✅ CONCLUSION BOT: UNDER 3.5 Safe"
 
-    # Envoi
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    msg = f"🔍 **{vrai_a} vs {vrai_b} - {heure}**\n"
+    msg += f"📍 Heure Bafoussam: {heure}\n\n"
+    msg += f"--- {vrai_a} (10 derniers) ---\n"
+    msg += f"Forme: {stat_a['forme']} | Moy buts marqués: {stat_a['moy_pour']:.2f} | Encaissés: {stat_a['moy_contre']:.2f}\n"
+    msg += f"BTTS: {stat_a['btts_rate']}% | Over 1.5: {stat_a['over15_rate']}% | Over 2.5: {stat_a['over25_rate']}%\n\n"
+    msg += f"--- {vrai_b} (10 derniers) ---\n"
+    msg += f"Forme: {stat_b['forme']} | Moy buts marqués: {stat_b['moy_pour']:.2f} | Encaissés: {stat_b['moy_contre']:.2f}\n"
+    msg += f"BTTS: {stat_b['btts_rate']}% | Over 1.5: {stat_b['over15_rate']}% | Over 2.5: {stat_b['over25_rate']}%\n\n"
+    msg += f"--- H2H ---\n{h2h_text}\n\n"
+    msg += f"--- CALCUL POISSON (λ={lam:.2f}) ---\n"
+    msg += f"Over 1.5 Poisson: {over15_p}% | Over 2.5 Poisson: {over25_p}% | BTTS Estimé: {btts_p}%\n\n"
+    msg += f"{reco}\n"
+    return msg
 
-if __name__ == "__main__":
-    main()
-name: Bot 2H
-on:
-  schedule:
-    - cron: '0 */2 * * *' # toutes les 2 heures
-  workflow_dispatch: # bouton manuel
+# BOUCLE TELEGRAM
+def main():
+    print("Bot chercheur démarré...")
+    offset = 0
+    while True:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
+        r = requests.get(url).json()
+        for upd in r.get('result', []):
+            offset = upd['update_id']+1
+            if 'message' not in upd: continue
+            chat_id = upd['message']['chat']['id']
+            text = upd['message'].get('text','')
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      - run: pip install requests pytz
-      - run: python bot.py
-        env:
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+            # Exemple: tu envoies 2 lignes
+            # Arsenal vs Chelsea 20:00
+            # Real vs Barca 21:00
+            lignes = text.split('\n')
+            reponse_finale = f"🕐 Analyse lancée à {datetime.now(TZ).strftime('%H:%M')} Bafoussam\n\n"
+            for ligne in lignes:
+                if 'vs' not in ligne.lower(): continue
+                # extrait heure
+                m = re.search(r'(\d{1,2}:\d{2})', ligne)
+                heure = m.group(1) if m else "??:??"
+                nom = re.sub(r'\d{1,2}:\d{2}', '', ligne).strip()
+                reponse_finale += analyse_match(nom, heure) + "\n\n---\n\n"
