@@ -98,3 +98,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+name: Bot 2H
+on:
+  schedule:
+    - cron: '0 */2 * * *' # toutes les 2 heures
+  workflow_dispatch: # bouton manuel
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install requests pytz
+      - run: python bot.py
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
